@@ -99,24 +99,28 @@ This is an early, load-bearing foundation, not a finished port. What works
 
 - ✅ **LZEXE v0.91 unpacker** — standalone (`tools/unlzexe.py`) *and* a C port in
   the runtime; reproduces the 136,682-byte image with all 152 relocations.
-- ✅ **Recompiler pipeline** — lifts **234 functions / ~31,700 lines of C** with
-  zero lifter errors, sharded for fast parallel compilation.
+- ✅ **Recompiler pipeline** — lifts **~560 functions** (near *and* the
+  Microsoft-C large-model far-code segments above DGROUP) with zero lifter
+  errors, every call resolved (no dispatch misses), sharded across ~13 files.
+- ✅ **Relocation-correct lifting** — segment immediates are rebased by the load
+  segment exactly as DOS would, so `DS` points at the real DGROUP. This is what
+  lets the game find its own data.
 - ✅ **Builds & links** a native `coaster.exe` (MSVC + SDL2 via vcpkg).
-- ✅ **Boots for real** — feed it the original `COASTER.EXE` and it unpacks,
-  relocates, and *executes* the recompiled startup, running through hundreds of
-  the game's own functions and the Microsoft-C runtime init.
+- ✅ **Boots into the game** — feed it the original `COASTER.EXE` and it unpacks,
+  relocates, runs the Microsoft-C startup into the game's `main()`, opens the
+  real `COASTER1.RSC` / `HSCORE.DAT`, and **reads its resource files**.
 
 What's **not** there yet:
 
-- ⏳ Most game logic is still auto-generated over stubbed leaf routines, so it
-  runs the boot path and exits rather than drawing the title screen.
-- ⏳ A handful of computed far-call targets and C-runtime helpers need real
-  implementations (tracked as `[STUB]` / `[DISPATCH]` log lines at runtime).
-- ⏳ Function-boundary detection in the C-runtime region is heuristic and will
-  be refined; rendering of the actual coaster view is future work.
+- ⏳ It currently **hangs partway through resource loading** — a tight loop in
+  real game code (likely a vertical-retrace/timer poll or a subtle lifting bug
+  in a decompression routine), so it doesn't yet reach the title screen.
+- ⏳ Function-boundary detection is heuristic; a few far-code spans over data
+  tables are imperfect, and some C-runtime/native shims are still stubs.
+- ⏳ Rendering the actual coaster view is future work.
 
-In other words: the engine turns over and the pistons fire. We haven't dropped
-it in gear yet. 🚗💨
+In other words: the engine turns over, it's idling, it's even reading the map —
+but it hasn't pulled out of the station yet. 🎢
 
 ### Build it
 

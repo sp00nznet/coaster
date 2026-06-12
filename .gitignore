@@ -1,0 +1,52 @@
+# ─────────────────────────────────────────────────────────────────────
+#  ORIGINAL GAME MATERIAL — never commit. Bring your own copy of Coaster.
+# ─────────────────────────────────────────────────────────────────────
+*.zip
+*.7z
+*.iso
+# Original / unpacked executables and all game data
+COASTER.EXE
+COASTER.exe
+COASTER_unpacked.exe
+INSTALL.EXE
+*.RSC
+*.rsc
+*.TRA
+*.tra
+*.DAT
+*.dat
+*.CFG
+*.cfg
+_extracted/
+game/
+gamedata/
+
+# ─── Build output ───
+build/
+out/
+cmake-build-*/
+*.exe
+*.obj
+*.o
+*.ilk
+*.pdb
+
+# ─── Analysis / working artifacts (derived from copyrighted binary) ───
+analysis/
+work/
+*.ppm
+*.bmp
+*.png.tmp
+
+# ─── IDE / OS ───
+.vs/
+.vscode/
+*.vcxproj.user
+*.suo
+.claude/
+Thumbs.db
+.DS_Store
+
+# ─── Python ───
+__pycache__/
+*.pyc

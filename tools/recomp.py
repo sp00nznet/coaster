@@ -77,22 +77,247 @@ def detect_dgroup(data, hdr_size):
     return max(counts, key=counts.get)
 
 
-def collect_call_targets(data, code_start, code_end, funcs):
-    """Harvest near-call destinations from the (reliably decoded) bodies of the
-    prologue-detected functions. These are genuine entry points and let us split
-    the BP-frameless run-time blob into real functions."""
+_JMPS = ('jmp', 'jo', 'jno', 'jb', 'jae', 'je', 'jne', 'jbe', 'ja', 'js',
+         'jns', 'jp', 'jnp', 'jl', 'jge', 'jle', 'jg')
+
+
+def _signed(disp):
+    """A 16-bit buffer-relative branch displacement read as signed, so back-edges
+    resolve to the correct lower address instead of wrapping ~64 KB forward."""
+    return disp - 0x10000 if disp >= 0x8000 else disp
+
+
+def _scan_call_targets(data, s, e, code_start, code_end, hdr_size):
+    """Return call/tail-jump destinations (file offsets) reachable from the body
+    [s, e). We collect: near/far CALL targets; FAR JMP targets (tail calls into
+    another segment); and *forward* near-JMP targets that land at or past the end
+    of this span (tail jumps to the following routine - a shared epilogue or a
+    fall-through continuation). Backward and in-range jumps are intra-function
+    control flow (the lifter turns them into labels) and are deliberately left
+    out so we never split a loop body into self-recursion."""
     targets = set()
-    for f in funcs:
-        if f.start >= code_end:
+    dec = Decoder(data[s:e], base_offset=s)
+    for inst in dec.decode_range(0, e - s):
+        op1 = inst.op1
+        if not op1:
             continue
-        end = min(f.end, code_end)
-        dec = Decoder(data[f.start:end], base_offset=f.start)
-        for inst in dec.decode_range(0, end - f.start):
-            if inst.mnemonic == 'call' and inst.op1 and inst.op1.type in (OpType.REL16, OpType.REL8):
-                t = f.start + inst.op1.disp
-                if code_start <= t < code_end:
+        if inst.mnemonic == 'call':
+            if op1.type in (OpType.REL16, OpType.REL8):
+                t = s + _signed(op1.disp)
+            elif op1.type == OpType.FAR:
+                t = hdr_size + op1.far_seg * 16 + op1.disp
+            else:
+                continue
+        elif inst.mnemonic in _JMPS:
+            if op1.type == OpType.FAR:
+                t = hdr_size + op1.far_seg * 16 + op1.disp
+            elif op1.type in (OpType.REL16, OpType.REL8):
+                t = s + _signed(op1.disp)
+                if t < e:           # internal jump -> label, not a new function
+                    continue
+            else:
+                continue
+        else:
+            continue
+        if code_start <= t < code_end:
+            targets.add(t)
+    return targets
+
+
+def harvest_far_pointers(data, tgt_lo, tgt_hi, hdr_size, reloc_words, data_start):
+    """Find function entries reached only through far-pointer tables. Every such
+    pointer's segment word is in the MZ relocation table; the word just before it
+    is the offset. A {seg:off} pair landing in [tgt_lo, tgt_hi) is a function the
+    direct-call scan can't see (it's only ever called indirectly). Only pointers
+    stored at or above data_start (the data region) are considered."""
+    targets = set()
+    for f in reloc_words:
+        if f < data_start or f + 2 > len(data):
+            continue
+        seg = struct.unpack_from('<H', data, f)[0]
+        off = struct.unpack_from('<H', data, f - 2)[0]
+        t = hdr_size + seg * 16 + off
+        if tgt_lo <= t < tgt_hi:
+            targets.add(t)
+    return targets
+
+
+def harvest_far_calls(data, funcs, tgt_lo, tgt_hi, hdr_size):
+    """Direct FAR-CALL / FAR-JMP destinations (file offsets) in [tgt_lo, tgt_hi)
+    issued from the given function spans. Used to seed the far-code region that
+    lives above DGROUP (Microsoft-C large-model far _TEXT segments)."""
+    targets = set()
+    for s, e, _ in funcs:
+        dec = Decoder(data[s:e], base_offset=s)
+        for inst in dec.decode_range(0, e - s):
+            op1 = inst.op1
+            if op1 and op1.type == OpType.FAR and inst.mnemonic in ('call', 'jmp'):
+                t = hdr_size + op1.far_seg * 16 + op1.disp
+                if tgt_lo <= t < tgt_hi:
                     targets.add(t)
     return targets
+
+
+def build_region(data, rstart, rend, hdr_size, seeds, prologue_funcs):
+    """Discover + merge + bound functions within [rstart, rend). Returns a list
+    of (start, end, is_far) spans. Shared by the near-code and far-code regions."""
+    seeds = {s for s in seeds if rstart <= s < rend}
+    if not seeds:
+        return []
+    starts = discover_functions(data, rstart, rend, hdr_size, seeds)
+    ordered = sorted(starts)
+    call_targets = set()
+    for i, s in enumerate(ordered):
+        e = ordered[i + 1] if i + 1 < len(ordered) else rend
+        dec = Decoder(data[s:min(e, rend)], base_offset=s)
+        for inst in dec.decode_range(0, min(e, rend) - s):
+            if inst.mnemonic != 'call' or not inst.op1:
+                continue
+            if inst.op1.type in (OpType.REL16, OpType.REL8):
+                t = s + _signed(inst.op1.disp)
+            elif inst.op1.type == OpType.FAR:
+                t = hdr_size + inst.op1.far_seg * 16 + inst.op1.disp
+            else:
+                continue
+            if rstart <= t < rend:
+                call_targets.add(t)
+    protected = seeds | call_targets
+    starts = sorted(merge_backward_loops(data, starts, rstart, rend, protected))
+    far_map = {f.start: f.is_far for f in prologue_funcs}
+    funcs = []
+    for i, s in enumerate(starts):
+        e = min(starts[i + 1] if i + 1 < len(starts) else rend, rend)
+        if e <= s:
+            continue
+        is_far = far_map.get(s, False) or any(
+            pf.start <= s < pf.end and pf.is_far for pf in prologue_funcs)
+        funcs.append((s, e, is_far))
+    return funcs
+
+
+_BRANCH = _JMPS + ('loop', 'loopz', 'loopnz', 'jcxz')
+
+
+def merge_backward_loops(data, starts, code_start, code_end, protected):
+    """Remove *soft* function boundaries that fall inside a loop body. If a branch
+    in one span targets an address before that span's start, the split cut a loop
+    in half - execution flows backward across the boundary, which a per-function
+    C lowering can only express as infinite tail-recursion. Merging the spans
+    turns the back-edge into an ordinary in-function goto.
+
+    Only soft boundaries (tail-jump split points) are removed; real entries -
+    prologues, the program entry, and call/far-pointer targets - are protected,
+    which both keeps genuine functions intact and bounds how far a single
+    mis-decoded back-edge can merge. Repeats to a fixpoint."""
+    starts = sorted(starts)
+    changed = True
+    while changed:
+        changed = False
+        drop = set()
+        for i, s in enumerate(starts):
+            e = starts[i + 1] if i + 1 < len(starts) else code_end
+            dec = Decoder(data[s:min(e, code_end)], base_offset=s)
+            for inst in dec.decode_range(0, min(e, code_end) - s):
+                if inst.mnemonic not in _BRANCH or not inst.op1:
+                    continue
+                if inst.op1.type not in (OpType.REL8, OpType.REL16):
+                    continue
+                d = inst.op1.disp
+                t = s + (d - 0x10000 if d >= 0x8000 else d)  # signed back-edge
+                if code_start <= t < s:
+                    for b in starts:
+                        if t < b <= s and b not in protected:
+                            drop.add(b)
+                            changed = True
+        if drop:
+            starts = [s for s in starts if s not in drop]
+    return starts
+
+
+_STOP = ('ret', 'retf', 'iret', 'iretf', 'jmp')  # no fall-through past these
+
+
+def trim_to_function(instructions, entry_rel=0):
+    """Drop trailing bytes that aren't actually code. We walk the control-flow
+    graph from the entry: fall-through (except past a return/unconditional jump)
+    plus in-range branch targets. Whatever isn't reached is data sitting after
+    the function (common for far routines stacked above data tables) or garbage
+    from decoding that data as instructions - either way it's cut. Reachability
+    is robust to the bogus jumps such data decodes into, since they're never
+    reached in the first place."""
+    if not instructions:
+        return instructions
+    by_addr = {ins.address: i for i, ins in enumerate(instructions)}
+    start = entry_rel if entry_rel in by_addr else instructions[0].address
+    reachable = set()
+    stack = [start, instructions[0].address]
+    while stack:
+        a = stack.pop()
+        if a in reachable or a not in by_addr:
+            continue
+        reachable.add(a)
+        ins = instructions[by_addr[a]]
+        if ins.mnemonic in _BRANCH and ins.op1 and \
+                ins.op1.type in (OpType.REL8, OpType.REL16):
+            d = ins.op1.disp
+            t = d if d < 0x8000 else d - 0x10000
+            if t in by_addr:
+                stack.append(t)
+        if ins.mnemonic not in _STOP:
+            stack.append(ins.address + ins.length)
+    cut = by_addr[max(reachable)]
+    return instructions[:cut + 1]
+
+
+def extend_entry_back(data, s, e, code_start, max_back=0x40000, max_iters=8):
+    """A function entry may sit in the middle of a shared code block whose loop
+    branches back to *before* the entry (a secondary entry point). Decode the
+    body and walk the lowest back-edge target downward so the lift range covers
+    it; the lifter then turns the back-edge into an internal goto and jumps to
+    the real entry at the top. Returns the (possibly lower) decode start.
+
+    Extension is bounded to max_back bytes: genuine secondary-entry loops are
+    only a handful of bytes back, whereas a data region decoded as code throws
+    off bogus far back-edges that would otherwise swallow the whole image."""
+    floor = max(code_start, s - max_back)
+    lo = s
+    for _ in range(max_iters):
+        new_lo = lo
+        dec = Decoder(data[lo:e], base_offset=lo)
+        for inst in dec.decode_range(0, e - lo):
+            if inst.mnemonic in _BRANCH and inst.op1 and \
+                    inst.op1.type in (OpType.REL8, OpType.REL16):
+                d = inst.op1.disp
+                t = lo + (d - 0x10000 if d >= 0x8000 else d)
+                if floor <= t < new_lo:
+                    new_lo = t
+        if new_lo == lo:
+            break
+        lo = new_lo
+    return lo
+
+
+def discover_functions(data, code_start, code_end, hdr_size, seeds, max_iters=12):
+    """Grow the function-start set to a fixpoint. Starting from reliable seeds
+    (Microsoft-C prologues + the entry point) we repeatedly carve the code into
+    [start, next-start) spans, harvest every call destination, and fold the new
+    ones back in. This transitively reaches functions that are only ever reached
+    through other functions - the bulk of the C run-time library, which has no
+    BP-frame prologues to detect directly."""
+    starts = set(s for s in seeds if code_start <= s < code_end)
+    for it in range(max_iters):
+        ordered = sorted(starts)
+        found = set()
+        for i, s in enumerate(ordered):
+            e = ordered[i + 1] if i + 1 < len(ordered) else code_end
+            found |= _scan_call_targets(data, s, min(e, code_end),
+                                        code_start, code_end, hdr_size)
+        new = found - starts
+        if not new:
+            print(f"  discovery converged after {it + 1} iterations")
+            break
+        starts |= new
+    return starts
 
 
 def recompile(exe_path, output_dir, funcs_per_file=50):
@@ -105,6 +330,15 @@ def recompile(exe_path, output_dir, funcs_per_file=50):
     print(f"\nLoaded {exe_path} ({len(data)} bytes)")
 
     hdr_size = struct.unpack_from('<H', data, 8)[0] * 16
+    # Segment where the loader places the image (must match startup.c).
+    LOAD_SEG = 0x0110
+    # File offsets of every MZ-relocated 16-bit word.
+    nrel = struct.unpack_from('<H', data, 6)[0]
+    reloff = struct.unpack_from('<H', data, 24)[0]
+    reloc_words = set()
+    for i in range(nrel):
+        ro, rs = struct.unpack_from('<HH', data, reloff + i * 4)
+        reloc_words.add(hdr_size + rs * 16 + ro)
     dgroup = detect_dgroup(data, hdr_size)
     code_start = hdr_size
     code_end = hdr_size + dgroup * 16 if dgroup else len(data)
@@ -120,39 +354,42 @@ def recompile(exe_path, output_dir, funcs_per_file=50):
     analyzer.extract_strings()
     prologue_funcs = [f for f in analyzer.functions if f.start < code_end]
 
-    call_targets = collect_call_targets(data, code_start, code_end, prologue_funcs)
     entry_cs = struct.unpack_from('<H', data, 22)[0]
     entry_ip = struct.unpack_from('<H', data, 20)[0]
     entry_off = hdr_size + entry_cs * 16 + entry_ip
 
-    starts = set(f.start for f in prologue_funcs if f.start < code_end)
-    starts |= {t for t in call_targets if code_start <= t < code_end}
-    starts.add(entry_off)
-    starts = sorted(starts)
+    img_size = analyzer.img_size
+    img_end = min(img_size, len(data))
+
+    # --- Near code region: [header, DGROUP) ---
+    near_seeds = set(f.start for f in prologue_funcs if f.start < code_end)
+    near_seeds.add(entry_off)
+    near_seeds |= harvest_far_pointers(data, code_start, code_end, hdr_size,
+                                       reloc_words, code_end)
+    near_funcs = build_region(data, code_start, code_end, hdr_size,
+                              near_seeds, prologue_funcs)
+
+    # --- Far code region: [DGROUP, image end) ---
+    # Microsoft-C large model places far _TEXT segments above DGROUP, interleaved
+    # with far data. Seed only from genuine far-call / far-pointer destinations so
+    # we lift the far routines without disassembling the data between them.
+    far_seeds = harvest_far_calls(data, near_funcs, code_end, img_end, hdr_size)
+    far_seeds |= harvest_far_pointers(data, code_end, img_end, hdr_size,
+                                      reloc_words, code_end)
+    far_funcs = build_region(data, code_end, img_end, hdr_size,
+                             far_seeds, prologue_funcs)
+    # far calls can reach further far routines - one more closure pass
+    more = harvest_far_calls(data, far_funcs, code_end, img_end, hdr_size)
+    if more - {f[0] for f in far_funcs}:
+        far_seeds |= more
+        far_funcs = build_region(data, code_end, img_end, hdr_size,
+                                 far_seeds, prologue_funcs)
+
+    funcs = sorted(near_funcs + far_funcs)
     print(f"  prologue functions : {len(prologue_funcs)}")
-    print(f"  call-target splits : {len(call_targets)}")
-    print(f"  total entry points : {len(starts)}")
-
-    # far-ness of a prologue function carries over to any split that starts inside it
-    far_map = {}
-    for f in prologue_funcs:
-        far_map[f.start] = f.is_far
-
-    # Build the final function table: start -> end (next start, clamped)
-    funcs = []
-    for i, s in enumerate(starts):
-        e = starts[i + 1] if i + 1 < len(starts) else code_end
-        e = min(e, code_end)
-        if e <= s:
-            continue
-        # inherit far-ness from the containing prologue function, if any
-        is_far = far_map.get(s, False)
-        if not is_far:
-            for pf in prologue_funcs:
-                if pf.start <= s < pf.end and pf.is_far:
-                    is_far = True
-                    break
-        funcs.append((s, e, is_far))
+    print(f"  near-code functions: {len(near_funcs)}")
+    print(f"  far-code functions : {len(far_funcs)}  (above DGROUP)")
+    print(f"  total functions    : {len(funcs)}")
 
     name_of = lambda off: f'sub_{off:06X}'
     known_funcs = {s: name_of(s) for s, _, _ in funcs}
@@ -160,17 +397,25 @@ def recompile(exe_path, output_dir, funcs_per_file=50):
     # --- Phase 2: lift ---
     print("\n--- Phase 2: Lifting ---")
     os.makedirs(output_dir, exist_ok=True)
+    # Clear stale generated output so a smaller run can't leave duplicate
+    # definitions behind (coaster_impl.c is hand-written and preserved).
+    import glob as _glob
+    for old in _glob.glob(os.path.join(output_dir, 'coaster_recomp_*.c')):
+        os.remove(old)
     all_lifted = []
     all_names = set()
     errors = 0
     for s, e, is_far in funcs:
-        code = data[s:e]
-        dec = Decoder(code, base_offset=s)
+        lo = extend_entry_back(data, s, e, code_start)
+        code = data[lo:e]
+        dec = Decoder(code, base_offset=lo)
         instructions = dec.decode_range(0, len(code))
-        lifter = Lifter(overlay_bases={}, hdr_size=hdr_size, known_funcs=known_funcs)
+        lifter = Lifter(overlay_bases={}, hdr_size=hdr_size, known_funcs=known_funcs,
+                        reloc_words=reloc_words, load_seg=LOAD_SEG)
         name = name_of(s)
         try:
-            c_code = lifter.lift_function(name, instructions, s, is_far)
+            c_code = lifter.lift_function(name, instructions, lo, is_far,
+                                          entry_addr=s - lo)
             all_lifted.append((s, e, name, c_code, lifter.func_calls))
             all_names.add(name)
         except Exception as ex:
@@ -235,7 +480,6 @@ def recompile(exe_path, output_dir, funcs_per_file=50):
 
     # dispatch table: maps a load-relative code address to its C function, so
     # the lifter's recomp_dispatch() can resolve indirect / computed far calls.
-    LOAD_SEG = 0x0110
     with open(os.path.join(output_dir, 'coaster_dispatch.c'), 'w') as out:
         out.write('/*\n * coaster_dispatch.c - indirect/computed-call resolver\n')
         out.write(' * AUTO-GENERATED by tools/recomp.py\n *\n')
@@ -251,7 +495,8 @@ def recompile(exe_path, output_dir, funcs_per_file=50):
             out.write(f'    {{ 0x{addr & 0xFFFFFFFF:06X}, {nm} }},\n')
         out.write('};\n')
         out.write(f'static const int g_dispatch_count = {len(table)};\n')
-        out.write(f'#define COASTER_LOAD_BASE 0x{LOAD_SEG * 16:X}u\n\n')
+        out.write(f'#define COASTER_LOAD_BASE 0x{LOAD_SEG * 16:X}u\n')
+        out.write(f'#define COASTER_HDR_SIZE  0x{hdr_size:X}u\n\n')
         out.write('''static recomp_fn lookup(uint32_t key)
 {
     int lo = 0, hi = g_dispatch_count - 1;
@@ -270,7 +515,10 @@ void recomp_dispatch(CPU *cpu, uint16_t seg, uint16_t off)
 {
     uint32_t flat = ((uint32_t)seg << 4) + off;
     recomp_fn fn = lookup(flat);
+    /* runtime seg:off (far pointer from relocated memory) -> strip load base */
     if (!fn && flat >= COASTER_LOAD_BASE) fn = lookup(flat - COASTER_LOAD_BASE);
+    /* file-offset encoding from tail-jump/indirect lowering -> strip header */
+    if (!fn && flat >= COASTER_HDR_SIZE)  fn = lookup(flat - COASTER_HDR_SIZE);
     if (fn) { fn(cpu); return; }
     {
         static int c = 0;

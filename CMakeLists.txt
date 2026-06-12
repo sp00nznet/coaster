@@ -52,13 +52,15 @@ if(RECOMP_SOURCES)
     )
     target_link_libraries(coaster_recomp PUBLIC coaster_hal)
 
-    # Auto-generated code: quiet the expected noise.
+    # Auto-generated code: quiet the expected noise, and DON'T optimize it - the
+    # giant straight-line CPU-emulation functions make the optimizer take minutes
+    # for no runtime benefit.
     if(MSVC)
         target_compile_options(coaster_recomp PRIVATE
-            /W0 /wd4101 /wd4102 /wd4244 /wd4267 /wd4146)
+            /Od /W0 /wd4101 /wd4102 /wd4244 /wd4267 /wd4146)
     else()
         target_compile_options(coaster_recomp PRIVATE
-            -w)
+            -O0 -w)
     endif()
 
     add_executable(coaster src/main.c src/recomp/startup.c)

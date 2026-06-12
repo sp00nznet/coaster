@@ -23,6 +23,9 @@ gamedata/
 
 # ─── Build output ───
 build/
+build*/
+*.dll
+*.lib
 out/
 cmake-build-*/
 *.exe

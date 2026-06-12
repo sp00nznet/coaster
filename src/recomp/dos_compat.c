@@ -114,9 +114,49 @@ void dos_init(DosState *ds, CPU *cpu, const char *game_dir)
     /* Screen columns at 0040:004A */
     mem_write16(cpu, 0x0040, 0x004A, 80);
 
-    ds->mem_top = 0x4000;  /* Start of free far memory (after program code+data) */
+    /* Start of free conventional memory, just above the loaded image. Coaster
+     * loads at seg 0x0110 and is ~0x2160 paragraphs, ending near 0x2270; round
+     * up so the game can grab the rest of the 640 KB (up to 0xA000). */
+    ds->mem_top = 0x2300;
 
     printf("[DOS] Initialized with game dir: %s\n", game_dir);
+}
+
+/* ── Diagnostics: dump whatever is on screen so we can see where boot stalls.
+ * Prints the 80x25 text buffer (0xB8000) and counts non-zero mode-13h pixels. */
+static void coaster_diag_screen(CPU *cpu, const char *why)
+{
+    fprintf(stderr, "[SCREEN] (%s) BIOS video mode=0x%02X\n", why, cpu->mem[0x449]);
+    int rows = 0;
+    for (int row = 0; row < 25; row++) {
+        char line[81];
+        int any = 0;
+        for (int col = 0; col < 80; col++) {
+            uint8_t ch = cpu->mem[0xB8000 + row * 160 + col * 2];
+            line[col] = (ch >= 32 && ch < 127) ? (char)ch : ' ';
+            if (ch > 32 && ch < 127) any = 1;
+        }
+        line[80] = 0;
+        if (any) { fprintf(stderr, "[TEXT %02d] %s\n", row, line); rows++; }
+    }
+    long nz = 0;
+    for (int i = 0; i < 320 * 200; i++)
+        if (cpu->mem[0xA0000 + i]) nz++;
+    fprintf(stderr, "[SCREEN] text rows=%d, mode13 nonzero pixels=%ld\n", rows, nz);
+}
+
+/* On a blocking key wait with no input queued, dump the screen once and - if
+ * COASTER_AUTOKEY is set - feed a synthetic Enter so headless boots advance
+ * through prompts instead of hanging. Returns the key, or -1 to keep blocking. */
+static int coaster_autokey(CPU *cpu, const char *site)
+{
+    static int dumped = 0;
+    if (!dumped) { dumped = 1; coaster_diag_screen(cpu, site); }
+    if (getenv("COASTER_AUTOKEY")) {
+        fprintf(stderr, "[AUTOKEY] %s -> Enter\n", site);
+        return 0x1C0D; /* scan 0x1C, ascii CR */
+    }
+    return -1;
 }
 
 /* ─── INT 21h - DOS API ─── */
@@ -458,7 +498,7 @@ void dos_int21(CPU *cpu)
     case 0x48: { /* Allocate memory */
         /* BX = paragraphs requested */
         uint16_t paras = cpu->bx;
-        if (g_dos->mem_top + paras < 0xA000) {
+        if ((uint32_t)g_dos->mem_top + paras <= 0xA000) {
             cpu->ax = g_dos->mem_top;
             fprintf(stderr, "[DOS] Alloc %u paras (%u bytes) -> seg 0x%04X\n",
                     paras, (unsigned)paras * 16, cpu->ax);
@@ -655,10 +695,14 @@ void bios_int16(CPU *cpu)
     switch (cpu->ah) {
     case 0x00: /* Read key (blocking) */
     case 0x10: /* Extended read key */
-        fprintf(stderr, "[BLOCK] Waiting for key in INT 16h/%02Xh\n", cpu->ah);
-        while (!keyboard_available(ks)) {
-            if (g_dos->poll_events)
-                g_dos->poll_events(g_dos->platform_ctx, g_dos, cpu);
+        if (!keyboard_available(ks)) {
+            int synth = coaster_autokey(cpu, "INT16/00");
+            if (synth >= 0) { cpu->ax = (uint16_t)synth; break; }
+            fprintf(stderr, "[BLOCK] Waiting for key in INT 16h/%02Xh\n", cpu->ah);
+            while (!keyboard_available(ks)) {
+                if (g_dos->poll_events)
+                    g_dos->poll_events(g_dos->platform_ctx, g_dos, cpu);
+            }
         }
         cpu->ax = keyboard_read(ks);
         fprintf(stderr, "[KEY] INT 16h/%02Xh: 0x%04X\n", cpu->ah, cpu->ax);

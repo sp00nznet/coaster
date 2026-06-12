@@ -152,10 +152,18 @@ def _label(addr: int, prefix: str = '') -> str:
     return f'L_{addr:06X}'
 
 
+def _sgn(disp):
+    """Interpret a 16-bit buffer-relative branch displacement as signed, so
+    a back-edge to code *before* the decode start resolves to the correct
+    (lower) address instead of wrapping forward by ~64 KB."""
+    return disp - 0x10000 if disp >= 0x8000 else disp
+
+
 class Lifter:
     """Lifts x86-16 instructions to C code."""
 
-    def __init__(self, overlay_bases=None, hdr_size=0x200, known_funcs=None):
+    def __init__(self, overlay_bases=None, hdr_size=0x200, known_funcs=None,
+                 reloc_words=None, load_seg=0):
         self.output = []
         self.indent = 1
         self.labels_needed = set()
@@ -169,6 +177,11 @@ class Lifter:
         self.hdr_size = hdr_size
         # Set of known function file offsets (for resolving far calls)
         self.known_funcs = known_funcs or set()
+        # File offsets of MZ-relocated 16-bit words. An immediate sitting at one
+        # of these is a segment value the DOS loader would fix up by adding the
+        # load segment - so we bake (value + load_seg) into the C instead.
+        self.reloc_words = reloc_words or set()
+        self.load_seg = load_seg
 
     def _emit(self, code: str, comment: str = ''):
         """Emit a line of C code with optional comment."""
@@ -205,6 +218,16 @@ class Lifter:
         op1 = inst.op1
         op2 = inst.op2
         op3 = inst.op3
+
+        # Relocation fixup: if this instruction's trailing 16-bit word was a MZ
+        # relocation target, its immediate operand is a segment value. Rebase it
+        # by the load segment, exactly as the DOS loader would (e.g. the C
+        # start-up's "MOV AX, DGROUP" / far-pointer construction).
+        if self.reloc_words and inst.length >= 2 and \
+                (inst.offset + inst.length - 2) in self.reloc_words:
+            for op in (op1, op2, op3):
+                if op and op.type == OpType.IMM16:
+                    op.disp = (op.disp + self.load_seg) & 0xFFFF
 
         # Emit label if this address is a jump target
         self._emit_label(inst.address)
@@ -520,7 +543,7 @@ class Lifter:
                     self._emit(f'goto {_label(target, self.func_name)};', orig)
                 else:
                     # Tail jump to another function (or shared continuation).
-                    abs_t = func_start + target
+                    abs_t = func_start + _sgn(target)
                     self._emit(f'{self._tail_jump(abs_t)} /* tail-jmp 0x{abs_t:06X} */', orig)
             elif op1 and op1.type == OpType.FAR:
                 # Direct far jmp seg:off (EA) — a tail jump. Resolve to the known
@@ -564,7 +587,7 @@ class Lifter:
                 self._emit(f'if ({cc}(cpu)) goto {_label(target, self.func_name)};', orig)
             else:
                 # Conditional tail jump to another function.
-                abs_t = func_start + target
+                abs_t = func_start + _sgn(target)
                 self._emit(f'if ({cc}(cpu)) {{ {self._tail_jump(abs_t)} }} '
                            f'/* tail-jcc 0x{abs_t:06X} */', orig)
 
@@ -574,7 +597,7 @@ class Lifter:
                 self.labels_needed.add(target)
                 self._emit(f'cpu->cx--; if (cpu->cx != 0) goto {_label(target, self.func_name)};', orig)
             else:
-                abs_t = func_start + target; tail = self._tail_jump(abs_t)
+                abs_t = func_start + _sgn(target); tail = self._tail_jump(abs_t)
                 self._emit(f'cpu->cx--; if (cpu->cx != 0) {{ {tail} }} /* loop tail 0x{abs_t:06X} */', orig)
 
         elif m == 'loopz':
@@ -584,7 +607,7 @@ class Lifter:
                 self._emit(f'cpu->cx--; if (cpu->cx != 0 && zf(cpu)) '
                            f'goto {_label(target, self.func_name)};', orig)
             else:
-                abs_t = func_start + target; tail = self._tail_jump(abs_t)
+                abs_t = func_start + _sgn(target); tail = self._tail_jump(abs_t)
                 self._emit(f'cpu->cx--; if (cpu->cx != 0 && zf(cpu)) {{ {tail} }} /* loopz tail 0x{abs_t:06X} */', orig)
 
         elif m == 'loopnz':
@@ -594,7 +617,7 @@ class Lifter:
                 self._emit(f'cpu->cx--; if (cpu->cx != 0 && !zf(cpu)) '
                            f'goto {_label(target, self.func_name)};', orig)
             else:
-                abs_t = func_start + target; tail = self._tail_jump(abs_t)
+                abs_t = func_start + _sgn(target); tail = self._tail_jump(abs_t)
                 self._emit(f'cpu->cx--; if (cpu->cx != 0 && !zf(cpu)) {{ {tail} }} /* loopnz tail 0x{abs_t:06X} */', orig)
 
         elif m == 'jcxz':
@@ -603,20 +626,24 @@ class Lifter:
                 self.labels_needed.add(target)
                 self._emit(f'if (cpu->cx == 0) goto {_label(target, self.func_name)};', orig)
             else:
-                abs_t = func_start + target; tail = self._tail_jump(abs_t)
+                abs_t = func_start + _sgn(target); tail = self._tail_jump(abs_t)
                 self._emit(f'if (cpu->cx == 0) {{ {tail} }} /* jcxz tail 0x{abs_t:06X} */', orig)
 
         elif m == 'call':
             if op1 and op1.type == OpType.REL16:
-                target = func_start + op1.disp
-                # Look up known function name at this address
+                target = func_start + _sgn(op1.disp)
+                # Simulate NEAR CALL: push 2-byte return IP on CPU stack
+                self._emit(f'push16(cpu, 0);', f'near call return addr')
                 if target in self.known_funcs:
                     func_name = self.known_funcs[target]
                 else:
-                    func_name = f'res_{target:06X}'
+                    # Unknown target (usually a mis-decoded back-edge into data).
+                    # Emit a near-safe stub - masking keeps the C identifier valid
+                    # for negative wrapped targets. recomp_dispatch is NOT used
+                    # here: it unwinds a FAR return (sp+=4) and would desync the
+                    # stack after a NEAR call.
+                    func_name = f'res_{target & 0xFFFFF:05X}'
                 self.func_calls.add(func_name)
-                # Simulate NEAR CALL: push 2-byte return IP on CPU stack
-                self._emit(f'push16(cpu, 0);', f'near call return addr')
                 self._emit(f'{func_name}(cpu);', orig)
             elif op1 and op1.type == OpType.FAR:
                 # Resolve far call segment:offset to a known function.
@@ -932,8 +959,14 @@ class Lifter:
             self._emit(f'/* UNHANDLED: {orig} */', orig)
 
     def lift_function(self, name: str, instructions: list, func_start: int,
-                      is_far: bool = False) -> str:
-        """Lift an entire function to C code."""
+                      is_far: bool = False, entry_addr=None) -> str:
+        """Lift an entire function to C code.
+
+        entry_addr (buffer-relative) lets the lifted code be entered partway in.
+        We use it when a function's loop has a back-edge to code *before* its
+        call entry (a secondary/shared entry point): the range is decoded from
+        the back-edge target so the edge becomes an in-function goto, and a
+        `goto` at the top jumps straight to the real entry for normal callers."""
         self.output = []
         self.labels_needed = set()
         self.labels_emitted = set()
@@ -956,9 +989,17 @@ class Lifter:
                     if target in self.valid_addrs:
                         self.labels_needed.add(target)
 
+        want_entry_goto = entry_addr is not None and entry_addr in self.valid_addrs \
+            and instructions and entry_addr != instructions[0].address
+        if want_entry_goto:
+            self.labels_needed.add(entry_addr)
+
         # Second pass: generate C code
         self.output.append(f'void {name}(CPU *cpu)')
         self.output.append('{')
+        if want_entry_goto:
+            self.output.append(f'    goto {_label(entry_addr, name)}; '
+                               f'/* secondary entry @ +0x{entry_addr:X} */')
 
         for inst in instructions:
             if inst.prefix == 'rep' and inst.mnemonic in ('movsb','movsw','movsd','stosb','stosw','stosd'):

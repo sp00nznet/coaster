@@ -47,11 +47,11 @@ typedef struct CPU {
     union { struct { uint8_t cl, ch; }; uint16_t cx; uint32_t ecx; };
     union { struct { uint8_t dl, dh; }; uint16_t dx; uint32_t edx; };
 
-    /* Index and pointer registers */
-    uint16_t si;
-    uint16_t di;
-    uint16_t bp;
-    uint16_t sp;
+    /* Index and pointer registers (16/32-bit views for 386 operand-size code) */
+    union { uint16_t si; uint32_t esi; };
+    union { uint16_t di; uint32_t edi; };
+    union { uint16_t bp; uint32_t ebp; };
+    union { uint16_t sp; uint32_t esp; };
 
     /* Segment registers */
     uint16_t cs;
@@ -284,6 +284,12 @@ static inline void flags_cmp32(CPU *cpu, uint32_t a, uint32_t b)
     set_szp32(cpu, result);
 }
 
+static inline void flags_logic32(CPU *cpu, uint32_t result)
+{
+    cpu->flags &= ~(FLAG_CF | FLAG_OF);
+    set_szp32(cpu, result);
+}
+
 /* Logical operation flags (CF=0, OF=0) */
 static inline void flags_logic8(CPU *cpu, uint8_t result)
 {
@@ -334,6 +340,16 @@ static inline int cc_l(CPU *cpu)  { return sf(cpu) != of(cpu); } /* less */
 static inline int cc_ge(CPU *cpu) { return sf(cpu) == of(cpu); } /* greater-or-equal */
 static inline int cc_le(CPU *cpu) { return zf(cpu) || (sf(cpu) != of(cpu)); } /* less-or-equal */
 static inline int cc_g(CPU *cpu)  { return !zf(cpu) && (sf(cpu) == of(cpu)); } /* greater */
+
+/* LSL (Load Segment Limit) - a 286+ protected-mode instruction. Real-mode DOS
+ * code never executes it; it only turns up when a data table is decoded as
+ * code. Always "fail" (ZF clear, no limit loaded) so such paths are inert. */
+static inline int cpu_lsl(CPU *cpu, uint16_t selector, uint16_t *out)
+{
+    (void)cpu; (void)selector;
+    if (out) *out = 0;
+    return 0;
+}
 
 /* ---------- CPU lifecycle ---------- */
 

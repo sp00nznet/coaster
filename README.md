@@ -183,10 +183,27 @@ coaster/
 
 ### Roadmap
 
-1. Replace C-runtime stubs (`_output`, memory, file I/O) with real shims so
-   `__astart` reaches the game's `main()`.
-2. Get the title screen and menu rendering through the VGA/EGA HAL.
-3. Track editor → ride view → the six judges. Make Mouszila ride again.
+1. ~~Get the Microsoft-C startup to reach the game's `main()`.~~ ✅ done
+2. ~~Load the game's resource files (`COASTER1.RSC`, the `.TRA` tracks).~~ ✅ the
+   game opens and reads them.
+3. **Crack the resource-loading hang** ← *we are here.* A tight loop in real
+   lifted code with no I/O — instrument the port reads / timer tick to tell a
+   hardware poll apart from a lifting bug, then squash it.
+4. Get the title screen and menu rendering through the VGA/EGA HAL.
+5. Track editor → ride view → the six judges. Make Mouszila ride again.
+
+### How we got here (milestones)
+
+The hard part of a recomp is rarely the first build — it's making the lifted
+code *behave*. The fixes that moved the needle, in order:
+
+| Fix | Why it mattered |
+|-----|-----------------|
+| **LZEXE v0.91 unpacker** (Python + C port) | The on-disk EXE is a compressed blob; nothing is possible until it's expanded and relocated. |
+| **Relocation-aware lifting** | The lifter baked the *un-relocated* `MOV DS, DGROUP`; `DS` pointed into the void and every filename read came back garbage (`"./H"`). Rebasing segment immediates by the load segment is what made the game find its own data — it instantly started opening `COASTER1.RSC`. |
+| **DOS `INT 21h/48` off-by-one** | Startup asked for exactly the free memory and the allocator refused it, deadlocking the boot. |
+| **Signed branch displacements** | Backward `call`/`jmp`/`jcc` wrapped ~64 KB forward into phantom symbols. Reading them as signed (in both the lifter and the function-discovery pass) resolved every call — zero dispatch misses. |
+| **Secondary-entry & far-code lifting** | Loops that branch *before* their own entry, plus the MSC large-model far-code segments above DGROUP, are now lifted correctly. |
 
 ---
 

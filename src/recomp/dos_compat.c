@@ -17,6 +17,7 @@
  */
 
 #include "recomp/dos_compat.h"
+#include "platform/sdl_platform.h"
 #include "hal/input.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -829,8 +830,90 @@ void port_out8(CPU *cpu, uint16_t port, uint8_t value)
         return;  /* EOI - ignore */
     }
 
-    /* All other ports: silently ignore */
+    /* Everything else is ignored -- but say so once per port. Coaster never
+     * calls INT 10h: its video driver programs the VGA directly, so this list
+     * IS the mode-set, and it is the only evidence of which mode. */
+    {
+        static uint8_t seen[0x400];
+        if (port < 0x400 && !seen[port]) {
+            seen[port] = 1;
+            fprintf(stderr, "[PORT] unhandled out 0x%03X, 0x%02X\n", port, value);
+        }
+    }
     (void)cpu;
+}
+
+#ifdef RECOMP_IRQ
+/* ---------- The timer interrupt, from inside a guest loop ----------
+ *
+ * Coaster waits for time to pass the way every DOS program does: its own INT
+ * 1Ch handler increments a word in DGROUP, and the code that wants to wait
+ * spins on that word. Lifted, that spin is a C loop with nothing outside it --
+ * the handler never runs, the word never changes, and the process sits there
+ * with a black window forever. (It also never pumps SDL, so the window stops
+ * answering the compositor and even a screenshot hangs.)
+ *
+ * The lifter emits RECOMP_TICK on every loop back-edge and this is what it
+ * calls: at most 18.2 times a second, pump the host and run whatever the guest
+ * installed on INT 1Ch (or INT 08h), exactly as the hardware would have.
+ *
+ * ponytail: one shared re-entrancy flag and a fixed budget. If a hot inner
+ * loop ever shows up in a profile, raise POLL_BUDGET -- the only cost of a
+ * bigger budget is coarser interrupt timing.
+ */
+#define POLL_BUDGET   4000    /* back-edges between clock reads */
+#define TICK_MS       55      /* 18.2 Hz, the PIT default */
+
+int g_recomp_tick_budget = POLL_BUDGET;
+
+void recomp_tick(CPU *cpu)
+{
+    static int in_isr = 0;
+    static uint64_t next_ms = 0;
+    uint64_t now;
+    uint32_t vec;
+
+    g_recomp_tick_budget = POLL_BUDGET;
+    if (in_isr || !g_dos) return;
+
+    now = platform_get_ticks();
+    if (next_ms == 0) { next_ms = now + TICK_MS; return; }
+    if (now < next_ms) return;
+    /* Catch up by whole ticks, but never try to replay a long stall. */
+    next_ms = (now - next_ms > 10 * TICK_MS) ? now + TICK_MS : next_ms + TICK_MS;
+
+    in_isr = 1;
+    if (g_dos->poll_events)
+        g_dos->poll_events(g_dos->platform_ctx, g_dos, cpu);
+    timer_update(&g_dos->timer, now);
+
+    /* The game's own handler. INT 1Ch is the one a program is supposed to
+     * hook; fall back to 08h for the ones that take the whole vector. */
+    vec = g_dos->ivt[0x1C];
+    if (!vec) vec = g_dos->ivt[0x08];
+    if (vec) {
+        void (*isr)(CPU *) = recomp_resolve((uint16_t)(vec >> 16), (uint16_t)vec);
+        /* Only a resolved handler: recomp_dispatch unwinds a far frame on a
+         * miss, and there is no frame here to unwind. A lifted `iret` is a
+         * plain return, so calling it as a function is the whole protocol. */
+        if (isr) isr(cpu);
+    }
+    in_isr = 0;
+}
+#endif /* RECOMP_IRQ */
+
+/* Word port I/O - two byte accesses, low half first (ISA bus behaviour).
+ * `mov dx,3C9h; rep outsw` is how a palette gets uploaded. */
+void port_out16(CPU *cpu, uint16_t port, uint16_t value)
+{
+    port_out8(cpu, port, (uint8_t)(value & 0xFF));
+    port_out8(cpu, (uint16_t)(port + 1), (uint8_t)(value >> 8));
+}
+
+uint16_t port_in16(CPU *cpu, uint16_t port)
+{
+    uint16_t lo = port_in8(cpu, port);
+    return (uint16_t)(lo | ((uint16_t)port_in8(cpu, (uint16_t)(port + 1)) << 8));
 }
 
 uint8_t port_in8(CPU *cpu, uint16_t port)

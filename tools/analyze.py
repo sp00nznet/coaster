@@ -12,7 +12,7 @@ Microsoft C 5.x function conventions:
   Args:      Pushed right-to-left, caller cleans stack (cdecl)
   Overlay:   INT 3Fh <ovl_num:u8> <offset:u16>
 
-Part of the Coaster Recomp project (sp00nznet/coaster)
+Part of the Coaster Recomp project (sp00nznet/coaster), synced from pcrecomp
 """
 
 import struct

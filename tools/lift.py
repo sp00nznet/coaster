@@ -13,11 +13,26 @@ Generated code style:
         ...
     }
 
-Part of the Coaster Recomp project (sp00nznet/coaster)
+Part of the Coaster Recomp project (sp00nznet/coaster), synced from pcrecomp
 """
 
 from decode16 import (Decoder, Instruction, OpType, Operand,
                       REG8_NAMES, REG16_NAMES, REG32_NAMES, SREG_NAMES)
+
+# Name of the host routine a DIV/IDIV by zero calls. On real hardware this is
+# INT 0; a lifted program cannot raise that, and killing the process on the
+# first one is the wrong trade -- a lifter that mis-sized one operand produces
+# a stream of them, and the first few are the diagnosis.
+#
+# This used to be the literal `catz_div0` at all six emission sites, so every
+# project after Catz inherited that project's prefix and had to alias it. Set
+# it before lifting if your runtime names the routine something else:
+#
+#     import lift16
+#     lift16.DIV0_FN = 'mygame_div0'
+#
+# Projects carrying the old name only need `#define catz_div0 recomp_div0`.
+DIV0_FN = 'recomp_div0'
 
 
 def _reg8(op: Operand) -> str:
@@ -152,13 +167,6 @@ def _label(addr: int, prefix: str = '') -> str:
     return f'L_{addr:06X}'
 
 
-def _sgn(disp):
-    """Interpret a 16-bit buffer-relative branch displacement as signed, so
-    a back-edge to code *before* the decode start resolves to the correct
-    (lower) address instead of wrapping forward by ~64 KB."""
-    return disp - 0x10000 if disp >= 0x8000 else disp
-
-
 class Lifter:
     """Lifts x86-16 instructions to C code."""
 
@@ -179,7 +187,11 @@ class Lifter:
         self.known_funcs = known_funcs or set()
         # File offsets of MZ-relocated 16-bit words. An immediate sitting at one
         # of these is a segment value the DOS loader would fix up by adding the
-        # load segment - so we bake (value + load_seg) into the C instead.
+        # load segment, so the lift bakes (value + load_seg) into the C instead.
+        # Without it the C start-up's `mov ax, DGROUP` loads the *link-time*
+        # segment and every global access lands 0x1100 bytes short of the data.
+        # Empty by default: a project that lifts per-segment (NE) has the
+        # relocations applied already and must leave this alone.
         self.reloc_words = reloc_words or set()
         self.load_seg = load_seg
 
@@ -212,6 +224,16 @@ class Lifter:
         return (f'recomp_dispatch(cpu, 0x{(abs_t >> 4) & 0xFFFF:X}, '
                 f'0x{abs_t & 0xF:X}); return;')
 
+    def _tick_back_edge(self, inst, target):
+        """A backward branch is a loop iteration, and a loop is the only place a
+        real machine would have taken an interrupt. A guest that busy-waits on a
+        counter its own timer ISR increments -- `cmp word [tick], ax / jb` --
+        never leaves its C function, so without a poll here nothing else in the
+        program ever runs again. Costs one decrement per iteration, and nothing
+        at all unless the project builds with the interrupt hook."""
+        if target <= inst.address:
+            self._emit('RECOMP_TICK(cpu);')
+
     def lift_instruction(self, inst: Instruction, func_start: int):
         """Lift a single instruction to C code."""
         m = inst.mnemonic
@@ -219,15 +241,25 @@ class Lifter:
         op2 = inst.op2
         op3 = inst.op3
 
-        # Relocation fixup: if this instruction's trailing 16-bit word was a MZ
+        # Relocation fixup: if this instruction's trailing 16-bit word was an MZ
         # relocation target, its immediate operand is a segment value. Rebase it
-        # by the load segment, exactly as the DOS loader would (e.g. the C
-        # start-up's "MOV AX, DGROUP" / far-pointer construction).
-        if self.reloc_words and inst.length >= 2 and \
-                (inst.offset + inst.length - 2) in self.reloc_words:
+        # by the load segment, exactly as the DOS loader would.
+        if self.reloc_words and inst.length >= 2 and                 (inst.offset + inst.length - 2) in self.reloc_words:
             for op in (op1, op2, op3):
                 if op and op.type == OpType.IMM16:
                     op.disp = (op.disp + self.load_seg) & 0xFFFF
+
+        # The source operand of a string instruction is DS:SI *by default* and
+        # takes a segment override like any other memory reference; the ES:DI
+        # destination cannot be overridden. Ignoring the prefix turns `es lodsb`
+        # into a read from the data segment -- DinoPark's text-mode read strips
+        # carriage returns with exactly that instruction, so every buffered read
+        # through a text stream came back holding the first bytes of DGROUP
+        # instead of the file.
+        _ssg = 'cpu->ds'
+        if inst.seg_override:
+            _ssg = (f'SEG_{_CODE_SEG}' if inst.seg_override == 'cs' and _CODE_SEG
+                    else f'cpu->{inst.seg_override}')
 
         # Emit label if this address is a jump target
         self._emit_label(inst.address)
@@ -251,12 +283,15 @@ class Lifter:
             _, off = _mem_addr(op2)
             self._emit(_write(op1, off), orig)
 
-        elif m in ('lds', 'les'):
-            # Load far pointer: reg = [mem], (DS|ES) = [mem+2]. The destination
+        elif m in ('lds', 'les', 'lss', 'lfs', 'lgs'):
+            # Load far pointer: reg = [mem], SREG = [mem+2]. The destination
             # register is often also part of the address (e.g. `les di,[di]` for
             # linked-list walks), so both words must be read into temps using the
-            # ORIGINAL address before either register is written.
-            sreg = 'cpu->ds' if m == 'lds' else 'cpu->es'
+            # ORIGINAL address before either register is written. lss/lfs/lgs are
+            # the 386 forms loading SS/FS/GS — e.g. the Jet stack-switch thunk's
+            # `lss sp, ss:[2]` that restores the caller's stack after the call.
+            sreg = {'lds': 'cpu->ds', 'les': 'cpu->es', 'lss': 'cpu->ss',
+                    'lfs': 'cpu->fs', 'lgs': 'cpu->gs'}[m]
             seg, off = _mem_addr(op2)
             self._emit(f'{{ uint16_t _o = mem_read16(cpu, {seg}, {off}); '
                        f'uint16_t _s = mem_read16(cpu, {seg}, (uint16_t)({off} + 2)); '
@@ -333,10 +368,13 @@ class Lifter:
             self._emit(_write(op1,
                 f'flags_add{sz}(cpu, {_read(op1)}, {_read(op2)})'), orig)
 
+        # The carry is a third input, not something that can be folded into the
+        # source: `flags_add16(a, b + cf)` with b = 0FFFFh and CF set adds zero
+        # and reports no carry out, so the high word of a long addition came
+        # out wrong whenever the low word was all ones.
         elif m == 'adc':
-            sz = _wsz(op1)
             self._emit(_write(op1,
-                f'flags_add{sz}(cpu, {_read(op1)}, {_read(op2)} + cf(cpu))'), orig)
+                f'flags_adc(cpu, {_read(op1)}, {_read(op2)}, {_wsz(op1)})'), orig)
 
         elif m == 'sub':
             sz = _wsz(op1)
@@ -344,9 +382,8 @@ class Lifter:
                 f'flags_sub{sz}(cpu, {_read(op1)}, {_read(op2)})'), orig)
 
         elif m == 'sbb':
-            sz = _wsz(op1)
             self._emit(_write(op1,
-                f'flags_sub{sz}(cpu, {_read(op1)}, {_read(op2)} + cf(cpu))'), orig)
+                f'flags_sbb(cpu, {_read(op1)}, {_read(op2)}, {_wsz(op1)})'), orig)
 
         elif m == 'cmp':
             sz = _wsz(op1)
@@ -371,7 +408,13 @@ class Lifter:
             self._emit(_write(op1, f'flags_sub{sz}(cpu, 0, {_read(op1)})'), orig)
 
         elif m == 'mul':
-            if op1.size == 1 or op1.type == OpType.REG8:
+            if _wsz(op1) == '32':
+                self._emit(f'{{ uint64_t _r = (uint64_t)cpu->eax * '
+                           f'(uint32_t){_read(op1)}; '
+                           f'cpu->eax = (uint32_t)_r; cpu->edx = (uint32_t)(_r >> 32); '
+                           f'cpu->flags = (cpu->flags & ~(FLAG_CF|FLAG_OF)) | '
+                           f'(cpu->edx ? FLAG_CF|FLAG_OF : 0); }}', orig)
+            elif op1.size == 1 or op1.type == OpType.REG8:
                 self._emit(f'{{ uint16_t _r = (uint16_t)cpu->al * {_read(op1)}; '
                            f'cpu->ax = _r; '
                            f'cpu->flags = (cpu->flags & ~(FLAG_CF|FLAG_OF)) | '
@@ -383,17 +426,30 @@ class Lifter:
                            f'(cpu->dx ? FLAG_CF|FLAG_OF : 0); }}', orig)
 
         elif m == 'imul' and op2 is not None:
-            # Two-operand imul: op1 = op1 * op2 (truncated, signed); CF/OF on overflow.
+            # Two-operand imul: op1 = op1 * op2 (truncated, signed); CF/OF on
+            # overflow. The 0x69/0x6B forms carry a third operand -- the real
+            # source -- in op3, and there the destination is write-only.
+            src = op3 if op3 is not None else op1
             sz = _wsz(op1)
             st = {'8': 'int8_t', '16': 'int16_t', '32': 'int32_t'}[sz]
-            self._emit(f'{{ long long _r = (long long)({st})({_read(op1)}) * '
+            self._emit(f'{{ long long _r = (long long)({st})({_read(src)}) * '
                        f'({st})({_read(op2)}); '
                        f'{_write(op1, f"(uint{sz}_t)_r")} '
                        f'cpu->flags = (cpu->flags & ~(FLAG_CF|FLAG_OF)) | '
                        f'((_r != ({st})_r) ? (FLAG_CF|FLAG_OF) : 0); }}', orig)
 
         elif m == 'imul':
-            if op1.size == 1 or op1.type == OpType.REG8:
+            if _wsz(op1) == '32':
+                # EDX:EAX = EAX * src. Without this the 0x66-prefixed form fell
+                # through to the 16-bit case, which reads AX and writes DX:AX --
+                # silently wrong by a factor of 2^16 on every 32-bit multiply.
+                self._emit(f'{{ long long _r = (long long)(int32_t)cpu->eax * '
+                           f'(int32_t){_read(op1)}; '
+                           f'cpu->eax = (uint32_t)(uint64_t)_r; '
+                           f'cpu->edx = (uint32_t)((uint64_t)_r >> 32); '
+                           f'cpu->flags = (cpu->flags & ~(FLAG_CF|FLAG_OF)) | '
+                           f'((_r != (int32_t)_r) ? FLAG_CF|FLAG_OF : 0); }}', orig)
+            elif op1.size == 1 or op1.type == OpType.REG8:
                 self._emit(f'{{ int16_t _r = (int16_t)(int8_t)cpu->al * '
                            f'(int8_t){_read(op1)}; '
                            f'cpu->ax = (uint16_t)_r; '
@@ -410,27 +466,41 @@ class Lifter:
                            f'FLAG_CF|FLAG_OF : 0); }}', orig)
 
         elif m == 'div':
-            if op1.size == 1 or op1.type == OpType.REG8:
+            if _wsz(op1) == '32':
+                self._emit(f'{{ uint64_t _n = ((uint64_t)cpu->edx << 32) | cpu->eax; '
+                           f'uint32_t _d = (uint32_t){_read(op1)}; '
+                           f'if (_d) {{ cpu->eax = (uint32_t)(_n / _d); '
+                           f'cpu->edx = (uint32_t)(_n % _d); }} else {DIV0_FN}("div32"); }}', orig)
+            elif op1.size == 1 or op1.type == OpType.REG8:
                 self._emit(f'{{ uint16_t _n = cpu->ax; uint8_t _d = {_read(op1)}; '
-                           f'cpu->al = (uint8_t)(_n / _d); '
-                           f'cpu->ah = (uint8_t)(_n % _d); }}', orig)
+                           f'if (_d) {{ cpu->al = (uint8_t)(_n / _d); '
+                           f'cpu->ah = (uint8_t)(_n % _d); }} else {DIV0_FN}("div8"); }}', orig)
             else:
                 self._emit(f'{{ uint32_t _n = ((uint32_t)cpu->dx << 16) | cpu->ax; '
                            f'uint16_t _d = {_read(op1)}; '
-                           f'cpu->ax = (uint16_t)(_n / _d); '
-                           f'cpu->dx = (uint16_t)(_n % _d); }}', orig)
+                           f'if (_d) {{ cpu->ax = (uint16_t)(_n / _d); '
+                           f'cpu->dx = (uint16_t)(_n % _d); }} else {DIV0_FN}("div16"); }}', orig)
 
         elif m == 'idiv':
-            if op1.size == 1 or op1.type == OpType.REG8:
+            if _wsz(op1) == '32':
+                # `cdq; idiv dword` is the standard 32-bit scale-then-divide.
+                # The 16-bit fallback built the dividend from DX:AX and truncated
+                # the divisor to int16, so a divisor of 0x10000 became 0 and the
+                # host took a #DE the guest would never have raised.
+                self._emit(f'{{ long long _n = (long long)(((uint64_t)cpu->edx << 32) '
+                           f'| cpu->eax); int32_t _d = (int32_t){_read(op1)}; '
+                           f'if (_d) {{ cpu->eax = (uint32_t)(int32_t)(_n / _d); '
+                           f'cpu->edx = (uint32_t)(int32_t)(_n % _d); }} else {DIV0_FN}("idiv32"); }}', orig)
+            elif op1.size == 1 or op1.type == OpType.REG8:
                 self._emit(f'{{ int16_t _n = (int16_t)cpu->ax; '
                            f'int8_t _d = (int8_t){_read(op1)}; '
-                           f'cpu->al = (uint8_t)(int8_t)(_n / _d); '
-                           f'cpu->ah = (uint8_t)(int8_t)(_n % _d); }}', orig)
+                           f'if (_d) {{ cpu->al = (uint8_t)(int8_t)(_n / _d); '
+                           f'cpu->ah = (uint8_t)(int8_t)(_n % _d); }} else {DIV0_FN}("idiv8"); }}', orig)
             else:
                 self._emit(f'{{ int32_t _n = (int32_t)(((uint32_t)cpu->dx << 16) '
                            f'| cpu->ax); int16_t _d = (int16_t){_read(op1)}; '
-                           f'cpu->ax = (uint16_t)(int16_t)(_n / _d); '
-                           f'cpu->dx = (uint16_t)(int16_t)(_n % _d); }}', orig)
+                           f'if (_d) {{ cpu->ax = (uint16_t)(int16_t)(_n / _d); '
+                           f'cpu->dx = (uint16_t)(int16_t)(_n % _d); }} else {DIV0_FN}("idiv16"); }}', orig)
 
         # ─── Logic ───
 
@@ -470,35 +540,56 @@ class Lifter:
             cnt = _read(op2)
             sz = _wsz(op1)
             bits = int(sz)
-            self._emit(f'{{ uint{sz}_t _v = {r}; uint8_t _c = {cnt}; '
-                       f'uint{sz}_t _r = _v << _c; '
-                       f'cpu->flags = (cpu->flags & ~FLAG_CF) | '
-                       f'((_v >> ({bits} - _c)) & 1 ? FLAG_CF : 0); '
+            # A zero count leaves every flag alone -- the old form computed
+            # `_v >> (bits - 0)` and called flags_shift anyway, so `shl r, cl`
+            # with cl=0 clobbered CF/SF/ZF/PF. Counts >= width also ran off the
+            # end of the shift. OF was never set at all (flags_shift only does
+            # SZP), which left a stale bit from whatever ran before.
+            self._emit(f'{{ uint{sz}_t _v = {r}; uint8_t _c = ({cnt}) & 0x1F; '
+                       f'if (_c) {{ uint{sz}_t _r = (_c >= {bits}) ? 0 '
+                       f': (uint{sz}_t)(_v << _c); '
+                       f'int _cf = (_c <= {bits}) ? ((_v >> ({bits} - _c)) & 1) : 0; '
+                       f'cpu->flags = (cpu->flags & ~(FLAG_CF | FLAG_OF)) '
+                       f'| (_cf ? FLAG_CF : 0) '
+                       f'| ((((_r >> ({bits} - 1)) & 1) ^ _cf) ? FLAG_OF : 0); '
                        f'flags_shift{sz}(cpu, _r); '
-                       f'{_write(op1, "_r")} }}', orig)
+                       f'{_write(op1, "_r")} }} }}', orig)
 
         elif m == 'shr':
             r = _read(op1)
             cnt = _read(op2)
             sz = _wsz(op1)
-            self._emit(f'{{ uint{sz}_t _v = {r}; uint8_t _c = {cnt}; '
-                       f'uint{sz}_t _r = _v >> _c; '
-                       f'cpu->flags = (cpu->flags & ~FLAG_CF) | '
-                       f'((_v >> (_c - 1)) & 1 ? FLAG_CF : 0); '
+            # `_c - 1` on a uint8_t zero is 255, so a zero count shifted by
+            # 255 (undefined) and clobbered flags that must stay untouched.
+            # SHR's OF is the top bit of the ORIGINAL operand.
+            bits = int(sz)
+            self._emit(f'{{ uint{sz}_t _v = {r}; uint8_t _c = ({cnt}) & 0x1F; '
+                       f'if (_c) {{ uint{sz}_t _r = (_c >= {bits}) ? 0 '
+                       f': (uint{sz}_t)(_v >> _c); '
+                       f'int _cf = (_c <= {bits}) ? ((_v >> (_c - 1)) & 1) : 0; '
+                       f'cpu->flags = (cpu->flags & ~(FLAG_CF | FLAG_OF)) '
+                       f'| (_cf ? FLAG_CF : 0) '
+                       f'| (((_v >> ({bits} - 1)) & 1) ? FLAG_OF : 0); '
                        f'flags_shift{sz}(cpu, _r); '
-                       f'{_write(op1, "_r")} }}', orig)
+                       f'{_write(op1, "_r")} }} }}', orig)
 
         elif m == 'sar':
             r = _read(op1)
             cnt = _read(op2)
             sz = _wsz(op1)
             stype = {'8': 'int8_t', '16': 'int16_t', '32': 'int32_t'}[sz]
-            self._emit(f'{{ {stype} _v = ({stype}){r}; uint8_t _c = {cnt}; '
-                       f'{stype} _r = _v >> _c; '
-                       f'cpu->flags = (cpu->flags & ~FLAG_CF) | '
-                       f'((_v >> (_c - 1)) & 1 ? FLAG_CF : 0); '
+            # Same zero-count and 255-shift problems as SHR. A count at or
+            # past the width saturates to an all-sign result rather than
+            # shifting off the end. SAR always clears OF.
+            bits = int(sz)
+            self._emit(f'{{ {stype} _v = ({stype}){r}; uint8_t _c = ({cnt}) & 0x1F; '
+                       f'if (_c) {{ uint8_t _s = (_c >= {bits}) ? {bits - 1} : _c; '
+                       f'{stype} _r = _v >> _s; '
+                       f'int _cf = (_v >> (_s - 1)) & 1; '
+                       f'cpu->flags = (cpu->flags & ~(FLAG_CF | FLAG_OF)) '
+                       f'| (_cf ? FLAG_CF : 0); '
                        f'flags_shift{sz}(cpu, (uint{sz}_t)_r); '
-                       f'{_write(op1, f"(uint{sz}_t)_r")} }}', orig)
+                       f'{_write(op1, f"(uint{sz}_t)_r")} }} }}', orig)
 
         elif m in ('rol', 'ror', 'rcl', 'rcr'):
             r = _read(op1)
@@ -540,10 +631,11 @@ class Lifter:
                 target = op1.disp
                 if target in self.valid_addrs:
                     self.labels_needed.add(target)
+                    self._tick_back_edge(inst, target)
                     self._emit(f'goto {_label(target, self.func_name)};', orig)
                 else:
                     # Tail jump to another function (or shared continuation).
-                    abs_t = func_start + _sgn(target)
+                    abs_t = func_start + target
                     self._emit(f'{self._tail_jump(abs_t)} /* tail-jmp 0x{abs_t:06X} */', orig)
             elif op1 and op1.type == OpType.FAR:
                 # Direct far jmp seg:off (EA) — a tail jump. Resolve to the known
@@ -563,7 +655,21 @@ class Lifter:
                                    f'recomp_dispatch(cpu, mem_read16(cpu,_s,(uint16_t)(_o+2)), '
                                    f'mem_read16(cpu,_s,_o)); return; }}', orig)
                     else:
-                        self._emit(f'recomp_dispatch(cpu, {_cseg()}, {_read(op1)}); return;', orig)
+                        arms = getattr(self, 'jump_tables', {}).get(inst.address)
+                        if arms:
+                            seg16 = int(_CODE_SEG, 16) * 16 if _CODE_SEG else 0
+                            self._emit('{ uint16_t _t = ' + _read(op1) + ';', orig)
+                            self._emit('  switch (_t) {')
+                            for _t in dict.fromkeys(arms):
+                                _rel = _t - func_start
+                                if _rel in self.valid_addrs:
+                                    self._emit('    case 0x%04X: goto %s;'
+                                               % (_t - seg16, _label(_rel, self.func_name)))
+                            self._emit('    default: recomp_dispatch(cpu, '
+                                       + _cseg() + ', _t); return;')
+                            self._emit('  } }')
+                        else:
+                            self._emit(f'recomp_dispatch(cpu, {_cseg()}, {_read(op1)}); return;', orig)
                 else:
                     self._emit(f'/* indirect jmp via {_read(op1)} - needs dispatch */', orig)
             else:
@@ -584,10 +690,11 @@ class Lifter:
             cc = CC_MAP[m]
             if target in self.valid_addrs:
                 self.labels_needed.add(target)
+                self._tick_back_edge(inst, target)
                 self._emit(f'if ({cc}(cpu)) goto {_label(target, self.func_name)};', orig)
             else:
                 # Conditional tail jump to another function.
-                abs_t = func_start + _sgn(target)
+                abs_t = func_start + target
                 self._emit(f'if ({cc}(cpu)) {{ {self._tail_jump(abs_t)} }} '
                            f'/* tail-jcc 0x{abs_t:06X} */', orig)
 
@@ -595,55 +702,70 @@ class Lifter:
             target = op1.disp
             if target in self.valid_addrs:
                 self.labels_needed.add(target)
+                self._tick_back_edge(inst, target)
                 self._emit(f'cpu->cx--; if (cpu->cx != 0) goto {_label(target, self.func_name)};', orig)
             else:
-                abs_t = func_start + _sgn(target); tail = self._tail_jump(abs_t)
+                abs_t = func_start + target; tail = self._tail_jump(abs_t)
                 self._emit(f'cpu->cx--; if (cpu->cx != 0) {{ {tail} }} /* loop tail 0x{abs_t:06X} */', orig)
 
         elif m == 'loopz':
             target = op1.disp
             if target in self.valid_addrs:
                 self.labels_needed.add(target)
+                self._tick_back_edge(inst, target)
                 self._emit(f'cpu->cx--; if (cpu->cx != 0 && zf(cpu)) '
                            f'goto {_label(target, self.func_name)};', orig)
             else:
-                abs_t = func_start + _sgn(target); tail = self._tail_jump(abs_t)
+                abs_t = func_start + target; tail = self._tail_jump(abs_t)
                 self._emit(f'cpu->cx--; if (cpu->cx != 0 && zf(cpu)) {{ {tail} }} /* loopz tail 0x{abs_t:06X} */', orig)
 
         elif m == 'loopnz':
             target = op1.disp
             if target in self.valid_addrs:
                 self.labels_needed.add(target)
+                self._tick_back_edge(inst, target)
                 self._emit(f'cpu->cx--; if (cpu->cx != 0 && !zf(cpu)) '
                            f'goto {_label(target, self.func_name)};', orig)
             else:
-                abs_t = func_start + _sgn(target); tail = self._tail_jump(abs_t)
+                abs_t = func_start + target; tail = self._tail_jump(abs_t)
                 self._emit(f'cpu->cx--; if (cpu->cx != 0 && !zf(cpu)) {{ {tail} }} /* loopnz tail 0x{abs_t:06X} */', orig)
 
         elif m == 'jcxz':
             target = op1.disp
             if target in self.valid_addrs:
                 self.labels_needed.add(target)
+                self._tick_back_edge(inst, target)
                 self._emit(f'if (cpu->cx == 0) goto {_label(target, self.func_name)};', orig)
             else:
-                abs_t = func_start + _sgn(target); tail = self._tail_jump(abs_t)
+                abs_t = func_start + target; tail = self._tail_jump(abs_t)
                 self._emit(f'if (cpu->cx == 0) {{ {tail} }} /* jcxz tail 0x{abs_t:06X} */', orig)
 
         elif m == 'call':
             if op1 and op1.type == OpType.REL16:
-                target = func_start + _sgn(op1.disp)
-                # Simulate NEAR CALL: push 2-byte return IP on CPU stack
-                self._emit(f'push16(cpu, 0);', f'near call return addr')
+                target = func_start + op1.disp
+                # A near branch wraps inside its own 64K segment: the hardware
+                # computes (IP + rel) & 0xFFFF. Lifting slices of a flat image
+                # we work in file offsets instead, so a call backwards past the
+                # segment base comes out NEGATIVE -- and every one of those was
+                # becoming a do-nothing stub. Wrapping it recovers the real
+                # target, which is 64K further up.
+                if target < 0 and (target + 0x10000) in self.known_funcs:
+                    target += 0x10000
+                # Look up known function name at this address
                 if target in self.known_funcs:
                     func_name = self.known_funcs[target]
                 else:
-                    # Unknown target (usually a mis-decoded back-edge into data).
-                    # Emit a near-safe stub - masking keeps the C identifier valid
-                    # for negative wrapped targets. recomp_dispatch is NOT used
-                    # here: it unwinds a FAR return (sp+=4) and would desync the
-                    # stack after a NEAR call.
-                    func_name = f'res_{target & 0xFFFFF:05X}'
+                    # A project lifting slices of a flat image (func_start is a
+                    # file offset, not a segment base) can produce a NEGATIVE
+                    # target here -- a mis-decoded back-edge in data reaching
+                    # below the start of the image. `res_{target:06X}` then
+                    # emits `res_-009CF`, which is not a C identifier and breaks
+                    # the whole translation unit rather than just that call.
+                    func_name = (f'res_{target:06X}' if target >= 0
+                                 else f'resn_{-target:06X}')
                 self.func_calls.add(func_name)
+                # Simulate NEAR CALL: push 2-byte return IP on CPU stack
+                self._emit(f'push16(cpu, 0xFFFF);', f'near call return addr')
                 self._emit(f'{func_name}(cpu);', orig)
             elif op1 and op1.type == OpType.FAR:
                 # Resolve far call segment:offset to a known function.
@@ -656,32 +778,45 @@ class Lifter:
                 func_name = None
                 seg = op1.far_seg
                 off = op1.disp
-                # Try corrected formula (seg-specific adjustment)
-                corr = 0x1A if seg == 0x205A else 0x14
-                far_file_off = seg * 16 + off - corr
-                if far_file_off in self.known_funcs:
-                    func_name = self.known_funcs[far_file_off]
+                # A project whose known_funcs are keyed so that a far seg:off
+                # maps straight onto far_base + seg*16 + off -- an image-offset
+                # lift of a relocated MZ -- says so, and gets an exact lookup.
+                far_base = getattr(self, 'far_base', None)
+                if far_base is not None:
+                    t = far_base + seg * 16 + off
+                    if t in self.known_funcs:
+                        func_name = self.known_funcs[t]
                 else:
-                    # Try original formula (hdr_size + seg*16 + off)
-                    far_file_off2 = self.hdr_size + seg * 16 + off
-                    if far_file_off2 in self.known_funcs:
-                        func_name = self.known_funcs[far_file_off2]
+                    # Try corrected formula (seg-specific adjustment)
+                    corr = 0x1A if seg == 0x205A else 0x14
+                    far_file_off = seg * 16 + off - corr
+                    if far_file_off in self.known_funcs:
+                        func_name = self.known_funcs[far_file_off]
+                    else:
+                        # Try original formula (hdr_size + seg*16 + off)
+                        far_file_off2 = self.hdr_size + seg * 16 + off
+                        if far_file_off2 in self.known_funcs:
+                            func_name = self.known_funcs[far_file_off2]
                 if not func_name:
                     func_name = f'far_{seg:04X}_{off:04X}'
                 self.func_calls.add(func_name)
                 # Simulate FAR CALL: push 4-byte return CS:IP on CPU stack
-                self._emit(f'push16(cpu, cpu->cs); push16(cpu, 0);', f'far call return addr')
+                self._emit(f'push16(cpu, cpu->cs); push16(cpu, 0xFFFF);', f'far call return addr')
                 self._emit(f'{func_name}(cpu);', orig)
             else:
                 if getattr(self, 'dispatch', False) and op1:
                     if op1.type == OpType.MEM and op1.size == 4:
                         seg, off = _mem_addr(op1)
                         self._emit(f'{{ uint16_t _o={off}; uint16_t _s={seg}; '
-                                   f'push16(cpu,cpu->cs); push16(cpu,0); '
-                                   f'recomp_dispatch(cpu, mem_read16(cpu,_s,(uint16_t)(_o+2)), '
+                                   f'push16(cpu,cpu->cs); push16(cpu,0xFFFF); '
+                                   f'dispatch_far(cpu, mem_read16(cpu,_s,(uint16_t)(_o+2)), '
                                    f'mem_read16(cpu,_s,_o)); }}', orig)
                     else:  # near indirect (word mem or register)
-                        self._emit(f'push16(cpu,0); recomp_dispatch(cpu, {_cseg()}, {_read(op1)});', orig)
+                        # dispatch_near/_far clean up the return frame the call site
+                        # pushed when the target turns out to be unknown;
+                        # recomp_dispatch does not, and the caller then reads
+                        # its own locals off a stack that is 2 or 4 bytes out.
+                        self._emit(f'push16(cpu,0xFFFF); dispatch_near(cpu, {_cseg()}, {_read(op1)});', orig)
                 else:
                     self._emit(f'/* indirect call {repr(op1)} - needs dispatch */', orig)
 
@@ -691,12 +826,12 @@ class Lifter:
             if getattr(self, 'dispatch', False) and op1 and op1.type == OpType.MEM:
                 seg, off = _mem_addr(op1)
                 self._emit(f'{{ uint16_t _o={off}; uint16_t _s={seg}; '
-                           f'push16(cpu,cpu->cs); push16(cpu,0); '
-                           f'recomp_dispatch(cpu, mem_read16(cpu,_s,(uint16_t)(_o+2)), '
+                           f'push16(cpu,cpu->cs); push16(cpu,0xFFFF); '
+                           f'dispatch_far(cpu, mem_read16(cpu,_s,(uint16_t)(_o+2)), '
                            f'mem_read16(cpu,_s,_o)); }}', orig)
             elif getattr(self, 'dispatch', False) and op1 and op1.type == OpType.FAR:
-                self._emit(f'push16(cpu,cpu->cs); push16(cpu,0); '
-                           f'recomp_dispatch(cpu, 0x{op1.far_seg:X}, 0x{op1.disp:X});', orig)
+                self._emit(f'push16(cpu,cpu->cs); push16(cpu,0xFFFF); '
+                           f'dispatch_far(cpu, 0x{op1.far_seg:X}, 0x{op1.disp:X});', orig)
             else:
                 self._emit(f'/* UNHANDLED: {orig} */', orig)
 
@@ -727,8 +862,19 @@ class Lifter:
             # far return resolves to nothing and just returns to the C caller.
             if getattr(self, 'dispatch', False):
                 extra = f' cpu->sp += 0x{op1.disp:X};' if op1 else ''
+                # A lifted call site pushes a sentinel return offset, so a
+                # popped IP equal to it is an ordinary return to the C caller --
+                # not a trampoline. Dispatching it anyway logs a miss for every
+                # far return in the program and buries the real ones.
+                #
+                # Two sentinels, not one. This lifter pushes 0xFFFF; a project
+                # whose hand-written call sites predate that pushed 0, and civ
+                # has 193 of them. Accepting only 0xFFFF turns every one of
+                # those returns into a dispatch to cs:0000 -- which hangs, and
+                # does so a long way from the cause. Nothing genuine returns to
+                # offset 0: a return address points *after* a call.
                 self._emit(f'{{ uint16_t _ip=pop16(cpu); uint16_t _cs=pop16(cpu);{extra} '
-                           f'recomp_dispatch(cpu,_cs,_ip); return; }}', orig)
+                           f'if (_ip != 0xFFFF && _ip != 0) recomp_dispatch(cpu,_cs,_ip); return; }}', orig)
             elif op1:
                 total = op1.disp + 4
                 self._emit(f'cpu->sp += 0x{total:X}; return;', orig)
@@ -749,7 +895,7 @@ class Lifter:
                     func_name = f'ovl{ovl_num:02d}_{ovl_off:04X}'
                 self.ovl_calls.add(func_name)
                 # Simulate FAR CALL for overlay dispatch
-                self._emit(f'push16(cpu, cpu->cs); push16(cpu, 0);',
+                self._emit(f'push16(cpu, cpu->cs); push16(cpu, 0xFFFF);',
                            f'overlay far call return addr')
                 self._emit(f'{func_name}(cpu);',
                            f'INT 3Fh -> OVL {ovl_num:02X}:{ovl_off:04X}')
@@ -768,15 +914,34 @@ class Lifter:
 
         elif m == 'movsb':
             self._emit(f'mem_write8(cpu, cpu->es, cpu->di, '
-                       f'mem_read8(cpu, cpu->ds, cpu->si)); '
+                       f'mem_read8(cpu, {_ssg}, cpu->si)); '
                        f'cpu->si += df(cpu) ? -1 : 1; '
                        f'cpu->di += df(cpu) ? -1 : 1;', orig)
 
         elif m == 'movsw':
             self._emit(f'mem_write16(cpu, cpu->es, cpu->di, '
-                       f'mem_read16(cpu, cpu->ds, cpu->si)); '
+                       f'mem_read16(cpu, {_ssg}, cpu->si)); '
                        f'cpu->si += df(cpu) ? -2 : 2; '
                        f'cpu->di += df(cpu) ? -2 : 2;', orig)
+
+        # Port string ops. OUTS reads DS:SI and writes port DX; INS the reverse
+        # through ES:DI. `mov dx,3C9h; rep outsb` is how a 256-colour palette
+        # gets uploaded, so dropping these loses the whole palette.
+        elif m == 'outsb':
+            self._emit(f'port_out8(cpu, cpu->dx, mem_read8(cpu, {_ssg}, cpu->si)); '
+                       f'cpu->si += df(cpu) ? -1 : 1;', orig)
+
+        elif m == 'outsw':
+            self._emit(f'port_out16(cpu, cpu->dx, mem_read16(cpu, {_ssg}, cpu->si)); '
+                       f'cpu->si += df(cpu) ? -2 : 2;', orig)
+
+        elif m == 'insb':
+            self._emit('mem_write8(cpu, cpu->es, cpu->di, port_in8(cpu, cpu->dx)); '
+                       'cpu->di += df(cpu) ? -1 : 1;', orig)
+
+        elif m == 'insw':
+            self._emit('mem_write16(cpu, cpu->es, cpu->di, port_in16(cpu, cpu->dx)); '
+                       'cpu->di += df(cpu) ? -2 : 2;', orig)
 
         elif m == 'stosb':
             self._emit(f'mem_write8(cpu, cpu->es, cpu->di, cpu->al); '
@@ -787,11 +952,11 @@ class Lifter:
                        f'cpu->di += df(cpu) ? -2 : 2;', orig)
 
         elif m == 'lodsb':
-            self._emit(f'cpu->al = mem_read8(cpu, cpu->ds, cpu->si); '
+            self._emit(f'cpu->al = mem_read8(cpu, {_ssg}, cpu->si); '
                        f'cpu->si += df(cpu) ? -1 : 1;', orig)
 
         elif m == 'lodsw':
-            self._emit(f'cpu->ax = mem_read16(cpu, cpu->ds, cpu->si); '
+            self._emit(f'cpu->ax = mem_read16(cpu, {_ssg}, cpu->si); '
                        f'cpu->si += df(cpu) ? -2 : 2;', orig)
 
         elif m == 'scasb':
@@ -803,13 +968,13 @@ class Lifter:
                        f'cpu->di += df(cpu) ? -2 : 2;', orig)
 
         elif m == 'cmpsb':
-            self._emit(f'flags_cmp8(cpu, mem_read8(cpu, cpu->ds, cpu->si), '
+            self._emit(f'flags_cmp8(cpu, mem_read8(cpu, {_ssg}, cpu->si), '
                        f'mem_read8(cpu, cpu->es, cpu->di)); '
                        f'cpu->si += df(cpu) ? -1 : 1; '
                        f'cpu->di += df(cpu) ? -1 : 1;', orig)
 
         elif m == 'cmpsw':
-            self._emit(f'flags_cmp16(cpu, mem_read16(cpu, cpu->ds, cpu->si), '
+            self._emit(f'flags_cmp16(cpu, mem_read16(cpu, {_ssg}, cpu->si), '
                        f'mem_read16(cpu, cpu->es, cpu->di)); '
                        f'cpu->si += df(cpu) ? -2 : 2; '
                        f'cpu->di += df(cpu) ? -2 : 2;', orig)
@@ -818,7 +983,7 @@ class Lifter:
 
         elif m == 'movsd':
             self._emit(f'mem_write32(cpu, cpu->es, cpu->di, '
-                       f'mem_read32(cpu, cpu->ds, cpu->si)); '
+                       f'mem_read32(cpu, {_ssg}, cpu->si)); '
                        f'cpu->si += df(cpu) ? -4 : 4; cpu->di += df(cpu) ? -4 : 4;', orig)
         elif m == 'stosd':
             self._emit(f'mem_write32(cpu, cpu->es, cpu->di, cpu->eax); '
@@ -931,7 +1096,10 @@ class Lifter:
                 port_expr = f'0x{op2.disp & 0xFF:02X}'
             else:
                 port_expr = _read(op2) if op2 else 'cpu->dx'
-            self._emit(_write(op1, f'port_in8(cpu, {port_expr})'), orig)
+            # `in ax, dx` reads port and port+1, not port twice truncated.
+            w16 = op1 is not None and op1.type == OpType.REG16
+            fn = 'port_in16' if w16 else 'port_in8'
+            self._emit(_write(op1, f'{fn}(cpu, {port_expr})'), orig)
 
         elif m == 'out':
             if op1 and op1.type == OpType.IMM8:
@@ -939,7 +1107,13 @@ class Lifter:
             else:
                 port_expr = _read(op1) if op1 else 'cpu->dx'
             val_expr = _read(op2) if op2 else 'cpu->al'
-            self._emit(f'port_out8(cpu, {port_expr}, {val_expr});', orig)
+            # A word OUT writes AL to the port and AH to port+1. Lowering it to
+            # port_out8 drops AH, which silently breaks every VGA index/data
+            # pair written the usual way -- `mov ax,(val<<8)|idx; out dx,ax`
+            # sets the index and loses the value.
+            w16 = op2 is not None and op2.type == OpType.REG16
+            fn = 'port_out16' if w16 else 'port_out8'
+            self._emit(f'{fn}(cpu, {port_expr}, {val_expr});', orig)
 
         elif m == 'wait':
             self._emit('/* wait */', orig)
@@ -950,10 +1124,18 @@ class Lifter:
         elif m == 'db':
             self._emit(f'/* data byte: 0x{op1.disp:02X} */', orig)
 
-        elif m.startswith('daa') or m.startswith('das') or \
-             m.startswith('aaa') or m.startswith('aas') or \
-             m.startswith('aam') or m.startswith('aad'):
-            self._emit(f'/* BCD: {orig} - stub */', orig)
+        # Packed/unpacked BCD. A C compiler never emits these, but MSC's and
+        # Borland's integer-to-decimal routines are hand-written assembly and
+        # AAM is how they split a byte into digits. Stubbed out this does not
+        # crash -- the game prints the wrong numbers.
+        elif m in ('daa', 'das', 'aaa', 'aas'):
+            self._emit(f'bcd_{m}(cpu);', orig)
+
+        elif m in ('aam', 'aad'):
+            # The divisor is an operand: `aam 16` splits a byte into hex
+            # nibbles, which is how assembly prints in bases other than ten.
+            base = (op1.disp & 0xFF) if op1 is not None else 10
+            self._emit(f'bcd_{m}(cpu, {base});', orig)
 
         else:
             self._emit(f'/* UNHANDLED: {orig} */', orig)
@@ -963,10 +1145,10 @@ class Lifter:
         """Lift an entire function to C code.
 
         entry_addr (buffer-relative) lets the lifted code be entered partway in.
-        We use it when a function's loop has a back-edge to code *before* its
-        call entry (a secondary/shared entry point): the range is decoded from
-        the back-edge target so the edge becomes an in-function goto, and a
-        `goto` at the top jumps straight to the real entry for normal callers."""
+        Use it when a function's loop has a back-edge to code *before* its call
+        entry (a secondary/shared entry point): decode the range from the
+        back-edge target so the edge becomes an in-function goto, and a `goto`
+        at the top jumps straight to the real entry for normal callers."""
         self.output = []
         self.labels_needed = set()
         self.labels_emitted = set()
@@ -977,6 +1159,18 @@ class Lifter:
 
         # Build set of valid instruction addresses for this function
         self.valid_addrs = set(inst.address for inst in instructions)
+
+        # Switch arms are leaders in THIS function. C has no computed goto, so
+        # an indirect jmp becomes a branch on the target address: goto for
+        # anything inside this function, dispatch only for the rest. Lifting an
+        # arm as its own function instead returns from the enclosing one with
+        # its epilogue unrun -- and for a switch inside a loop it is worse,
+        # turning the loop into mutual recursion.
+        for _a, _arms in getattr(self, 'jump_tables', {}).items():
+            for _t in _arms:
+                _rel = _t - func_start
+                if _rel in self.valid_addrs:
+                    self.labels_needed.add(_rel)
 
         # First pass: collect jump targets for labels (only within function)
         for inst in instructions:
@@ -989,20 +1183,23 @@ class Lifter:
                     if target in self.valid_addrs:
                         self.labels_needed.add(target)
 
-        want_entry_goto = entry_addr is not None and entry_addr in self.valid_addrs \
-            and instructions and entry_addr != instructions[0].address
+        want_entry_goto = entry_addr is not None and entry_addr in self.valid_addrs             and instructions and entry_addr != instructions[0].address
         if want_entry_goto:
             self.labels_needed.add(entry_addr)
 
         # Second pass: generate C code
         self.output.append(f'void {name}(CPU *cpu)')
         self.output.append('{')
+        # Which lifted functions ran, in order, for when the process dies
+        # somewhere in 600 generated functions with no usable host backtrace.
+        # A no-op macro unless the project builds with RECOMP_TRACE.
+        self.output.append(f'    RECOMP_ENTER("{name}");')
         if want_entry_goto:
             self.output.append(f'    goto {_label(entry_addr, name)}; '
                                f'/* secondary entry @ +0x{entry_addr:X} */')
 
         for inst in instructions:
-            if inst.prefix == 'rep' and inst.mnemonic in ('movsb','movsw','movsd','stosb','stosw','stosd'):
+            if inst.prefix == 'rep' and inst.mnemonic in ('movsb','movsw','movsd','stosb','stosw','stosd','outsb','outsw','insb','insw'):
                 self._emit_label(inst.address)
                 self._emit(f'while (cpu->cx != 0) {{ cpu->cx--;', f'rep {inst.mnemonic}')
                 self.indent += 1

@@ -25,9 +25,17 @@ import struct
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import decode16
 from decode16 import Decoder, OpType
 from analyze import Analyzer
 from lift import Lifter
+
+# We decode one function-sized *slice* at a time (base_offset = its file
+# offset), so `pos` is slice-relative, not a segment offset. Wrapping a branch
+# target to 16 bits would turn a back-edge into 0xFFFx and land it 64 KB too
+# high; unwrapped a back-edge is simply negative, and adding the function start
+# gives the right file offset. See decode16.WRAP_NEAR_TARGETS.
+decode16.WRAP_NEAR_TARGETS = False
 
 
 HEADER = """\
@@ -55,6 +63,8 @@ extern void int_handler(CPU *cpu, uint8_t num);
 /* Port I/O (implemented in dos_compat.c) */
 extern void port_out8(CPU *cpu, uint16_t port, uint8_t value);
 extern uint8_t port_in8(CPU *cpu, uint16_t port);
+extern void port_out16(CPU *cpu, uint16_t port, uint16_t value);
+extern uint16_t port_in16(CPU *cpu, uint16_t port);
 
 """
 
@@ -81,12 +91,6 @@ _JMPS = ('jmp', 'jo', 'jno', 'jb', 'jae', 'je', 'jne', 'jbe', 'ja', 'js',
          'jns', 'jp', 'jnp', 'jl', 'jge', 'jle', 'jg')
 
 
-def _signed(disp):
-    """A 16-bit buffer-relative branch displacement read as signed, so back-edges
-    resolve to the correct lower address instead of wrapping ~64 KB forward."""
-    return disp - 0x10000 if disp >= 0x8000 else disp
-
-
 def _scan_call_targets(data, s, e, code_start, code_end, hdr_size):
     """Return call/tail-jump destinations (file offsets) reachable from the body
     [s, e). We collect: near/far CALL targets; FAR JMP targets (tail calls into
@@ -103,7 +107,7 @@ def _scan_call_targets(data, s, e, code_start, code_end, hdr_size):
             continue
         if inst.mnemonic == 'call':
             if op1.type in (OpType.REL16, OpType.REL8):
-                t = s + _signed(op1.disp)
+                t = s + op1.disp
             elif op1.type == OpType.FAR:
                 t = hdr_size + op1.far_seg * 16 + op1.disp
             else:
@@ -112,7 +116,7 @@ def _scan_call_targets(data, s, e, code_start, code_end, hdr_size):
             if op1.type == OpType.FAR:
                 t = hdr_size + op1.far_seg * 16 + op1.disp
             elif op1.type in (OpType.REL16, OpType.REL8):
-                t = s + _signed(op1.disp)
+                t = s + op1.disp
                 if t < e:           # internal jump -> label, not a new function
                     continue
             else:
@@ -140,6 +144,64 @@ def harvest_far_pointers(data, tgt_lo, tgt_hi, hdr_size, reloc_words, data_start
         if tgt_lo <= t < tgt_hi:
             targets.add(t)
     return targets
+
+
+def harvest_near_vtables(data, funcs, code_start, code_end, data_start):
+    """Function entries that are only ever reached through a near-pointer table.
+
+    Coaster's video layer is a driver vtable: `mov bx,[mode]` then
+    `jmp word ds:[bx+0x20B6]`, where the table holds near code offsets. Nothing
+    calls those routines directly, so prologue scanning and the call-target
+    closure both miss them -- they end up swallowed into whichever function
+    happens to precede them, and the indirect jump lands in the middle of a C
+    function that cannot be entered there. At run time that is a dispatch miss
+    and the driver call silently does nothing.
+
+    So: for every indirect `jmp`/`call` through `[reg + disp]` in DS, read the
+    table at DGROUP+disp and take each word that points into the code region as
+    a function entry. The walk stops at the first word that does not (the table
+    is followed by ordinary data), and is capped so a misidentified base cannot
+    run away.
+
+    The table is not always pure -- Coaster's has four descriptor fields sitting
+    in the middle of it - and a word that is really a struct field can seed a
+    spurious split. That is survivable here: a split mid-function lowers to a
+    tail call into the new half with the CPU state in the struct, which is the
+    same execution. Missing a real entry is not survivable, so the trade goes
+    this way.
+    """
+    MAX_ENTRIES = 64
+    bases = set()
+    for s, e, _ in funcs:
+        dec = Decoder(data[s:e], base_offset=s)
+        for inst in dec.decode_range(0, e - s):
+            op1 = inst.op1
+            if inst.mnemonic not in ('jmp', 'call') or not op1:
+                continue
+            if op1.type != OpType.MEM or op1.size != 2:
+                continue
+            if op1.seg not in ('', 'ds') or not op1.base:
+                continue
+            if op1.disp > 0:
+                bases.add(op1.disp)
+
+    targets = set()
+    for b in bases:
+        at = data_start + b
+        for _ in range(MAX_ENTRIES):
+            if at + 2 > len(data):
+                break
+            w = struct.unpack_from('<H', data, at)[0]
+            t = hdr_size_of(data) + w
+            if not w or not (code_start <= t < code_end):
+                break
+            targets.add(t)
+            at += 2
+    return targets
+
+
+def hdr_size_of(data):
+    return struct.unpack_from('<H', data, 8)[0] * 16
 
 
 def harvest_far_calls(data, funcs, tgt_lo, tgt_hi, hdr_size):
@@ -174,7 +236,7 @@ def build_region(data, rstart, rend, hdr_size, seeds, prologue_funcs):
             if inst.mnemonic != 'call' or not inst.op1:
                 continue
             if inst.op1.type in (OpType.REL16, OpType.REL8):
-                t = s + _signed(inst.op1.disp)
+                t = s + inst.op1.disp
             elif inst.op1.type == OpType.FAR:
                 t = hdr_size + inst.op1.far_seg * 16 + inst.op1.disp
             else:
@@ -222,8 +284,7 @@ def merge_backward_loops(data, starts, code_start, code_end, protected):
                     continue
                 if inst.op1.type not in (OpType.REL8, OpType.REL16):
                     continue
-                d = inst.op1.disp
-                t = s + (d - 0x10000 if d >= 0x8000 else d)  # signed back-edge
+                t = s + inst.op1.disp        # already signed (WRAP_NEAR_TARGETS)
                 if code_start <= t < s:
                     for b in starts:
                         if t < b <= s and b not in protected:
@@ -259,10 +320,8 @@ def trim_to_function(instructions, entry_rel=0):
         ins = instructions[by_addr[a]]
         if ins.mnemonic in _BRANCH and ins.op1 and \
                 ins.op1.type in (OpType.REL8, OpType.REL16):
-            d = ins.op1.disp
-            t = d if d < 0x8000 else d - 0x10000
-            if t in by_addr:
-                stack.append(t)
+            if ins.op1.disp in by_addr:
+                stack.append(ins.op1.disp)
         if ins.mnemonic not in _STOP:
             stack.append(ins.address + ins.length)
     cut = by_addr[max(reachable)]
@@ -287,8 +346,7 @@ def extend_entry_back(data, s, e, code_start, max_back=0x40000, max_iters=8):
         for inst in dec.decode_range(0, e - lo):
             if inst.mnemonic in _BRANCH and inst.op1 and \
                     inst.op1.type in (OpType.REL8, OpType.REL16):
-                d = inst.op1.disp
-                t = lo + (d - 0x10000 if d >= 0x8000 else d)
+                t = lo + inst.op1.disp
                 if floor <= t < new_lo:
                     new_lo = t
         if new_lo == lo:
@@ -368,6 +426,15 @@ def recompile(exe_path, output_dir, funcs_per_file=50):
                                        reloc_words, code_end)
     near_funcs = build_region(data, code_start, code_end, hdr_size,
                               near_seeds, prologue_funcs)
+    # Driver vtables are only visible once there is code to scan, so this is a
+    # second pass over the functions the first pass found.
+    vtbl = harvest_near_vtables(data, near_funcs, code_start, code_end, code_end)
+    if vtbl - near_seeds:
+        print(f"  vtable entries     : {len(vtbl)} "
+              f"({len(vtbl - near_seeds)} new)")
+        near_seeds |= vtbl
+        near_funcs = build_region(data, code_start, code_end, hdr_size,
+                                  near_seeds, prologue_funcs)
 
     # --- Far code region: [DGROUP, image end) ---
     # Microsoft-C large model places far _TEXT segments above DGROUP, interleaved
@@ -412,6 +479,12 @@ def recompile(exe_path, output_dir, funcs_per_file=50):
         instructions = dec.decode_range(0, len(code))
         lifter = Lifter(overlay_bases={}, hdr_size=hdr_size, known_funcs=known_funcs,
                         reloc_words=reloc_words, load_seg=LOAD_SEG)
+        lifter.far_base = hdr_size   # known_funcs key == hdr_size + seg*16 + off
+        # Lower indirect jmp/call through the dispatch table instead of leaving
+        # a comment. Without this an `jmp word es:[bx+N]` lifted to nothing and
+        # execution FELL THROUGH into whatever followed - which is how
+        # sub_00550E ended up calling itself 98,000 times.
+        lifter.dispatch = True
         name = name_of(s)
         try:
             c_code = lifter.lift_function(name, instructions, lo, is_far,
@@ -488,6 +561,7 @@ def recompile(exe_path, output_dir, funcs_per_file=50):
         out.write(' * right C function via a sorted table of load-relative addresses.\n */\n\n')
         out.write('#include "recomp/cpu.h"\n#include "coaster_recomp.h"\n#include <stdio.h>\n\n')
         out.write('typedef void (*recomp_fn)(CPU *);\n')
+        out.write('recomp_fn recomp_resolve(uint16_t seg, uint16_t off);\n')
         out.write('typedef struct { uint32_t addr; recomp_fn fn; } DispatchEntry;\n\n')
         out.write('static const DispatchEntry g_dispatch[] = {\n')
         table = sorted((s - hdr_size, name_of(s)) for s, _, _ in funcs)
@@ -511,7 +585,7 @@ def recompile(exe_path, output_dir, funcs_per_file=50):
 
 /* seg:off may be load-relative (baked-in direct far calls) or carry the load
  * segment (far pointers read from relocated memory); try both interpretations. */
-void recomp_dispatch(CPU *cpu, uint16_t seg, uint16_t off)
+recomp_fn recomp_resolve(uint16_t seg, uint16_t off)
 {
     uint32_t flat = ((uint32_t)seg << 4) + off;
     recomp_fn fn = lookup(flat);
@@ -519,13 +593,61 @@ void recomp_dispatch(CPU *cpu, uint16_t seg, uint16_t off)
     if (!fn && flat >= COASTER_LOAD_BASE) fn = lookup(flat - COASTER_LOAD_BASE);
     /* file-offset encoding from tail-jump/indirect lowering -> strip header */
     if (!fn && flat >= COASTER_HDR_SIZE)  fn = lookup(flat - COASTER_HDR_SIZE);
+    return fn;
+}
+
+static void miss(const char *kind, uint16_t seg, uint16_t off)
+{
+    static int c = 0;
+#ifdef RECOMP_TRACE
+    /* The first few misses are the ones worth explaining: the entry ring says
+     * which lifted function jumped into nowhere. */
+    if (c < 3) recomp_trace_dump("dispatch miss");
+#endif
+    if (c++ < 32)
+        fprintf(stderr, "[DISPATCH] %s miss %04X:%04X (flat %05X)\\n", kind, seg, off,
+                ((uint32_t)seg << 4) + off);
+}
+
+/* Tail-jump / far-return form: the frame is already gone. */
+void recomp_dispatch(CPU *cpu, uint16_t seg, uint16_t off)
+{
+    recomp_fn fn = recomp_resolve(seg, off);
     if (fn) { fn(cpu); return; }
-    {
-        static int c = 0;
-        if (c++ < 32)
-            fprintf(stderr, "[DISPATCH] unresolved %04X:%04X (flat %05X)\\n", seg, off, flat);
-    }
+    miss("jmp", seg, off);
     cpu->sp += 4; /* simulate far ret so the caller can unwind */
+}
+
+/* Call forms. The lifted call site has already pushed a return frame - 2 bytes
+ * near, 4 far - so an unresolved target must pop back exactly that much, or the
+ * caller reads its own locals off a stack that is two or four bytes out and
+ * corrupts quietly instead of crashing. A miss is not fatal: the game builds
+ * function-pointer tables at run time and not every slot is filled on every
+ * path. */
+void dispatch_near(CPU *cpu, uint16_t seg, uint16_t off)
+{
+    recomp_fn fn = recomp_resolve(seg, off);
+    if (fn) { fn(cpu); return; }
+    miss("near", seg, off);
+    cpu->sp += 2;
+}
+
+void dispatch_far(CPU *cpu, uint16_t seg, uint16_t off)
+{
+    recomp_fn fn = recomp_resolve(seg, off);
+    if (fn) { fn(cpu); return; }
+    miss("far", seg, off);
+    cpu->sp += 4;
+}
+
+/* DIV/IDIV by zero. On real hardware this is INT 0, which a lifted program
+ * cannot raise; killing the process on the first one hides the diagnosis,
+ * because a mis-sized operand produces a stream of them and the first few are
+ * the evidence. Leave the quotient alone and carry on. */
+void recomp_div0(const char *what)
+{
+    static long n = 0;
+    if (++n <= 10) fprintf(stderr, "[DIV0] %s divide by zero #%ld\\n", what, n);
 }
 ''')
     print(f"  coaster_dispatch.c: {len(table)}-entry table")

@@ -7,6 +7,10 @@ set(CMAKE_CXX_STANDARD 20)
 if(MSVC)
     add_compile_options(/utf-8)
     add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
+    # Lifted code is deep and frame-heavy: every guest function is a C function
+    # with its own locals, and a guest call chain becomes a C call chain of the
+    # same depth. The 1 MB default overflows inside resource loading.
+    add_link_options(/STACK:8388608)  # 8 MB
 endif()
 if(MINGW OR CMAKE_C_COMPILER_ID STREQUAL "GNU")
     add_compile_options(-Wall -Wextra -Wno-unused-parameter)
@@ -14,6 +18,19 @@ endif()
 
 # ─── SDL2 (from vcpkg or system) ───
 find_package(SDL2 CONFIG REQUIRED)
+
+# -DRECOMP_TRACE=ON: every lifted function announces itself into a ring buffer
+# and the process dumps it when the C stack gets too deep. For finding a
+# runaway recursion, which a host backtrace of 600 generated functions cannot.
+option(RECOMP_TRACE "Trace lifted function entry + trip on stack depth" OFF)
+if(RECOMP_TRACE)
+    add_compile_definitions(RECOMP_TRACE)
+endif()
+
+# The guest waits on a counter its own INT 1Ch handler increments, so lifted
+# code has to give the interrupt a chance to run. Not optional here: without it
+# the game reaches its first timed wait and never leaves.
+add_compile_definitions(RECOMP_IRQ)
 
 include_directories(${CMAKE_SOURCE_DIR}/include)
 include_directories(${CMAKE_SOURCE_DIR}/RecompiledFuncs)
@@ -25,6 +42,7 @@ add_library(coaster_hal STATIC
     src/hal/timer.c
     src/recomp/cpu.c
     src/recomp/dos_compat.c
+    src/recomp/recomp_trace.c
 )
 target_include_directories(coaster_hal PUBLIC
     ${CMAKE_SOURCE_DIR}/include

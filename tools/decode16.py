@@ -1,11 +1,11 @@
 """
-decode16.py - 16-bit x86 Instruction Decoder for Civilization Recomp
+decode16.py - 16-bit x86 Instruction Decoder
 
 Table-driven decoder for 8086/80186 instructions as emitted by
 Microsoft C 5.x. Handles all real-mode addressing, segment overrides,
 ModR/M byte decoding, and the MSC overlay manager INT 3Fh calls.
 
-Part of the Coaster Recomp project (sp00nznet/coaster)
+Part of the Coaster Recomp project (sp00nznet/coaster), synced from pcrecomp
 """
 
 from dataclasses import dataclass, field
@@ -124,6 +124,36 @@ class Instruction:
 
 # ─── Decoder ─────────────────────────────────────────────────────
 
+
+class EndOfSegment(IndexError):
+    """A read ran past the end of the segment being decoded.
+
+    Subclasses IndexError so the existing `except IndexError` recovery paths --
+    which turn a truncated instruction into a `db` byte -- keep working."""
+
+# Does a near call/jmp target wrap inside a 64K segment?
+#
+# On the hardware it always does: the target is (IP + rel) & 0xFFFF. That is
+# right whenever `base_offset` is a segment base, so `pos` is the segment
+# offset -- which is how every 32-bit and NE project here drives the decoder.
+#
+# A project that decodes a *slice* of a flat image (civ hands us one function
+# at a time, base_offset = its file offset) has a `pos` that is relative to
+# that slice, and a backwards call produces a small NEGATIVE target which the
+# lifter then adds to the function's start. Masking that to 16 bits turns it
+# into 0xFFFx and lands the call 0x10000 too high -- silently, on a real
+# function that happens to exist up there. Those projects set this False once:
+#
+#     import decode16
+#     decode16.WRAP_NEAR_TARGETS = False
+WRAP_NEAR_TARGETS = True
+
+
+def _near(target: int) -> int:
+    """A relative branch target, wrapped inside its segment or not."""
+    return (target & 0xFFFF) if WRAP_NEAR_TARGETS else target
+
+
 class Decoder:
     """16-bit x86 instruction decoder."""
 
@@ -132,20 +162,27 @@ class Decoder:
         self.base = base_offset
         self.pos = 0
 
+    # A segment can end mid-instruction -- the tail is usually padding or data the
+    # linker never filled. Reading past it raised IndexError and aborted the whole
+    # decode (Dogz's THINK.DLL does this on its first code segment). Raise a
+    # private end-of-segment signal instead, so the caller can drop the partial
+    # instruction and stop the walk. Fabricating zero bytes would be worse: the
+    # padding decodes as `add [bx+si], al` and invents instructions that are not
+    # there.
     def _u8(self) -> int:
+        if self.pos >= len(self.data):
+            raise EndOfSegment()
         b = self.data[self.pos]
         self.pos += 1
         return b
 
     def _s8(self) -> int:
-        b = self.data[self.pos]
-        self.pos += 1
+        b = self._u8()
         return b if b < 128 else b - 256
 
     def _u16(self) -> int:
-        lo = self.data[self.pos]
-        hi = self.data[self.pos + 1]
-        self.pos += 2
+        lo = self._u8()
+        hi = self._u8()
         return lo | (hi << 8)
 
     def _s16(self) -> int:
@@ -153,10 +190,7 @@ class Decoder:
         return v if v < 32768 else v - 65536
 
     def _u32(self) -> int:
-        v = (self.data[self.pos] | (self.data[self.pos + 1] << 8) |
-             (self.data[self.pos + 2] << 16) | (self.data[self.pos + 3] << 24))
-        self.pos += 4
-        return v
+        return self._u16() | (self._u16() << 16)
 
     def _s32(self) -> int:
         v = self._u32()
@@ -262,10 +296,31 @@ class Decoder:
                 seg_override = 'ss'; self.pos += 1
             elif b == 0x3E:
                 seg_override = 'ds'; self.pos += 1
+            elif b == 0x64:
+                seg_override = 'fs'; self.pos += 1
+            elif b == 0x65:
+                # FS/GS are 386 additions, so 16-bit code is not "supposed" to
+                # use them -- but performance-minded 16-bit code does. Indeo 3's
+                # IR32.DLL keeps decoder state in an FS-addressed block and
+                # reaches it with `64 89 2E ..` / `67 64 89 ..`. Without these
+                # two prefixes the 0x64 byte decodes as an unknown opcode, the
+                # sweep resyncs one byte in, and the misalignment then blames
+                # perfectly ordinary movs that follow it.
+                seg_override = 'gs'; self.pos += 1
             elif b == 0x66:
                 self.op32 = True; self.pos += 1   # operand-size override
             elif b == 0x67:
                 self.addr32 = True; self.pos += 1  # address-size override
+            elif b == 0x9B and self.pos + 1 < len(self.data)                     and 0xD8 <= self.data[self.pos + 1] <= 0xDF:
+                # FWAIT immediately before an ESC opcode is part of that x87
+                # instruction, and IDA marks the head on the 0x9B. Decoding it
+                # as a standalone `wait` swallowed the head and the real opcode
+                # was never decoded at all -- `9B DD 7E E0` (fstsw m16) vanished,
+                # so Borland's compare idiom
+                #   fcomp ...; fstsw [bp-N]; mov ax,[bp-N]; sahf; jbe
+                # loaded a stale stack local and every float comparison in the
+                # engine branched on garbage. Treat it as a prefix.
+                self.pos += 1
             elif b == 0xF2:
                 rep_prefix = 'repnz'; self.pos += 1
             elif b == 0xF3:
@@ -358,12 +413,18 @@ class Decoder:
             inst.mnemonic = 'push'
             inst.op1 = self._wimm()
 
-        # IMUL r16/32, r/m, imm16/32 (80186+)
+        # IMUL r16/32, r/m, imm16/32 (80186+). THREE operands: the
+        # destination register is not also the source -- `imul bx, [bp-2],
+        # 19Eh` reads a local and writes bx. Dropping the r/m operand makes
+        # it read the destination instead, which is silently wrong whenever
+        # the two differ. Kept in op3 so the immediate stays in op2 and the
+        # two-operand form is unaffected.
         elif opcode == 0x69:
             reg, rm, rn = self._decode_modrm(True, seg_override)
             inst.mnemonic = 'imul'
             inst.op1 = reg
             inst.op2 = self._wimm()
+            inst.op3 = rm
 
         # PUSH imm8 (sign-extended to operand size) (80186+)
         elif opcode == 0x6A:
@@ -373,12 +434,13 @@ class Decoder:
             else:
                 inst.op1 = Operand(type=OpType.IMM8, disp=self._s8() & 0xFFFF, size=2)
 
-        # IMUL r16, r/m16, imm8 (80186+)
+        # IMUL r16, r/m16, imm8 (80186+) -- three operands, see 0x69.
         elif opcode == 0x6B:
             reg, rm, rn = self._decode_modrm(True, seg_override)
             inst.mnemonic = 'imul'
             inst.op1 = reg
             inst.op2 = Operand(type=OpType.IMM8, disp=self._s8() & 0xFFFF, size=2)
+            inst.op3 = rm
 
         # Jcc short (0x70-0x7F)
         elif 0x70 <= opcode <= 0x7F:
@@ -386,7 +448,7 @@ class Decoder:
                         'js','jns','jp','jnp','jl','jge','jle','jg']
             inst.mnemonic = CC_NAMES[opcode - 0x70]
             rel = self._s8()
-            target = (self.pos + rel) & 0xFFFF
+            target = _near(self.pos + rel)
             inst.op1 = Operand(type=OpType.REL8, disp=target, size=2)
 
         # Group 1: ALU r/m, imm
@@ -508,6 +570,14 @@ class Decoder:
             inst.mnemonic = 'mov'
             inst.op1 = Operand(type=OpType.MOFFS, disp=self._u16(), seg=seg_override or 'ds', size=self._wbytes())
             inst.op2 = self._wreg(0)
+
+        # Port string ops (386). INS/OUTS move between DX and ES:DI / DS:SI.
+        # A 256-colour palette upload is `mov dx,3C9h; rep outsb`, so without
+        # these the whole palette silently never reaches the DAC.
+        elif opcode == 0x6C: inst.mnemonic = 'insb'
+        elif opcode == 0x6D: inst.mnemonic = 'insd' if self.op32 else 'insw'
+        elif opcode == 0x6E: inst.mnemonic = 'outsb'
+        elif opcode == 0x6F: inst.mnemonic = 'outsd' if self.op32 else 'outsw'
 
         # String ops (word form -> dword with 0x66)
         elif opcode == 0xA4: inst.mnemonic = 'movsb'
@@ -646,10 +716,10 @@ class Decoder:
         # AAM, AAD
         elif opcode == 0xD4:
             inst.mnemonic = 'aam'
-            self._u8()  # base (usually 0x0A)
+            inst.op1 = Operand(type=OpType.IMM8, disp=self._u8(), size=1)
         elif opcode == 0xD5:
             inst.mnemonic = 'aad'
-            self._u8()  # base
+            inst.op1 = Operand(type=OpType.IMM8, disp=self._u8(), size=1)
 
         # XLAT
         elif opcode == 0xD7: inst.mnemonic = 'xlat'
@@ -663,19 +733,19 @@ class Decoder:
         elif opcode == 0xE0:
             inst.mnemonic = 'loopnz'
             rel = self._s8()
-            inst.op1 = Operand(type=OpType.REL8, disp=(self.pos + rel) & 0xFFFF, size=2)
+            inst.op1 = Operand(type=OpType.REL8, disp=_near(self.pos + rel), size=2)
         elif opcode == 0xE1:
             inst.mnemonic = 'loopz'
             rel = self._s8()
-            inst.op1 = Operand(type=OpType.REL8, disp=(self.pos + rel) & 0xFFFF, size=2)
+            inst.op1 = Operand(type=OpType.REL8, disp=_near(self.pos + rel), size=2)
         elif opcode == 0xE2:
             inst.mnemonic = 'loop'
             rel = self._s8()
-            inst.op1 = Operand(type=OpType.REL8, disp=(self.pos + rel) & 0xFFFF, size=2)
+            inst.op1 = Operand(type=OpType.REL8, disp=_near(self.pos + rel), size=2)
         elif opcode == 0xE3:
             inst.mnemonic = 'jcxz'
             rel = self._s8()
-            inst.op1 = Operand(type=OpType.REL8, disp=(self.pos + rel) & 0xFFFF, size=2)
+            inst.op1 = Operand(type=OpType.REL8, disp=_near(self.pos + rel), size=2)
 
         # IN AL/AX, imm8
         elif opcode == 0xE4:
@@ -700,14 +770,14 @@ class Decoder:
         # CALL rel16
         elif opcode == 0xE8:
             rel = self._s16()
-            target = (self.pos + rel) & 0xFFFF
+            target = _near(self.pos + rel)
             inst.mnemonic = 'call'
             inst.op1 = Operand(type=OpType.REL16, disp=target, size=2)
 
         # JMP rel16
         elif opcode == 0xE9:
             rel = self._s16()
-            target = (self.pos + rel) & 0xFFFF
+            target = _near(self.pos + rel)
             inst.mnemonic = 'jmp'
             inst.op1 = Operand(type=OpType.REL16, disp=target, size=2)
 
@@ -721,7 +791,7 @@ class Decoder:
         # JMP rel8
         elif opcode == 0xEB:
             rel = self._s8()
-            target = (self.pos + rel) & 0xFFFF
+            target = _near(self.pos + rel)
             inst.mnemonic = 'jmp'
             inst.op1 = Operand(type=OpType.REL8, disp=target, size=2)
 
@@ -798,7 +868,7 @@ class Decoder:
             if 0x80 <= op2b <= 0x8F:          # Jcc near rel16
                 inst.mnemonic = 'j' + CC[op2b - 0x80]
                 rel = self._s16()
-                inst.op1 = Operand(type=OpType.REL16, disp=(self.pos + rel) & 0xFFFF, size=2)
+                inst.op1 = Operand(type=OpType.REL16, disp=_near(self.pos + rel), size=2)
             elif 0x90 <= op2b <= 0x9F:        # SETcc r/m8
                 _, rm, _ = self._decode_modrm(False, seg_override)
                 inst.mnemonic = 'set' + CC[op2b - 0x90]
@@ -834,6 +904,10 @@ class Decoder:
             elif op2b in (0x02, 0x03):        # LAR / LSL r16, r/m16 (selector validity)
                 reg, rm, _ = self._decode_modrm(True, seg_override)
                 inst.mnemonic = 'lar' if op2b == 0x02 else 'lsl'
+                inst.op1 = reg; inst.op2 = rm
+            elif op2b in (0xB2, 0xB4, 0xB5):  # LSS / LFS / LGS r16, m16:16 (load far ptr)
+                reg, rm, _ = self._decode_modrm(True, seg_override)
+                inst.mnemonic = {0xB2: 'lss', 0xB4: 'lfs', 0xB5: 'lgs'}[op2b]
                 inst.op1 = reg; inst.op2 = rm
             elif op2b in (0xA0, 0xA1, 0xA8, 0xA9):   # PUSH/POP FS/GS
                 inst.mnemonic = 'push' if op2b in (0xA0, 0xA8) else 'pop'

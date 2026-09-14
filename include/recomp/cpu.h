@@ -11,7 +11,7 @@
  * We allocate a flat 1 MB + 64K buffer and translate segment:offset
  * addresses to flat offsets at runtime.
  *
- * Part of the Coaster Recomp project (sp00nznet/coaster)
+ * Part of the Coaster Recomp project (sp00nznet/coaster), synced from pcrecomp
  */
 
 #ifndef COASTER_RECOMP_CPU_H
@@ -58,6 +58,11 @@ typedef struct CPU {
     uint16_t ds;
     uint16_t es;
     uint16_t ss;
+    /* A 386 in a 16-bit segment can carry an FS/GS override, and the
+     * decoder emits one wherever it reads a 0x64/0x65 byte -- including
+     * in the data the linear scan walks through between functions. */
+    uint16_t fs;
+    uint16_t gs;
 
     /* Instruction pointer (for debugging/tracing) */
     uint16_t ip;
@@ -77,49 +82,90 @@ typedef struct CPU {
 } CPU;
 
 /* ---------- Segment:offset → flat address ---------- */
+/* Real mode multiplies the segment by 16, which is what a DOS binary means
+ * and what this defaults to. Protected mode does not: a selector is an index
+ * into a descriptor table and its base has nothing to do with its numeric
+ * value, so a Windows NE needs a lookup instead. Defining SEG_OFF before
+ * including this header replaces the rule and nothing else - the accessors
+ * below, and every lifted `mem_read16(cpu, cpu->ds, off)`, are unchanged. */
+#ifndef SEG_OFF
+#define SEG_OFF(seg, off) ((((uint32_t)(uint16_t)(seg)) << 4) + (uint32_t)(uint16_t)(off))
+#endif
+
 static inline uint32_t seg_off(uint16_t seg, uint16_t off)
 {
-    return ((uint32_t)seg << 4) + off;
+    return SEG_OFF(seg, off);
 }
+
+/* Not all of the address space is plain memory. A planar VGA in an unchained
+ * mode turns one byte address into four pixels, one per plane, chosen by the
+ * Map Mask -- so a write there cannot be a store and a read cannot be a load.
+ * Defining RECOMP_MEM_HOOK before including this header routes byte accesses
+ * through a pair the project supplies; returning 0 from the write hook means
+ * `not mine, store it normally`. Everything else, including every lifted
+ * mem_read16, is unchanged. Costs one predictable branch per byte access, and
+ * only when a project asks for it. */
+#ifdef RECOMP_MEM_HOOK
+int recomp_mem_write8(CPU *cpu, uint32_t addr, uint8_t val);   /* 1 = handled */
+int recomp_mem_read8(CPU *cpu, uint32_t addr, uint8_t *out);   /* 1 = handled */
+#endif
 
 /* ---------- Memory access ---------- */
 static inline uint8_t mem_read8(CPU *cpu, uint16_t seg, uint16_t off)
 {
+#ifdef RECOMP_MEM_HOOK
+    uint8_t v;
+    if (recomp_mem_read8(cpu, seg_off(seg, off), &v)) return v;
+#endif
     return cpu->mem[seg_off(seg, off)];
 }
 
 static inline uint16_t mem_read16(CPU *cpu, uint16_t seg, uint16_t off)
 {
+#ifdef RECOMP_MEM_HOOK
+    return (uint16_t)mem_read8(cpu, seg, off) |
+           ((uint16_t)mem_read8(cpu, seg, (uint16_t)(off + 1)) << 8);
+#else
     uint32_t addr = seg_off(seg, off);
     return (uint16_t)cpu->mem[addr] | ((uint16_t)cpu->mem[addr + 1] << 8);
+#endif
 }
 
 static inline void mem_write8(CPU *cpu, uint16_t seg, uint16_t off, uint8_t val)
 {
+#ifdef RECOMP_MEM_HOOK
+    if (recomp_mem_write8(cpu, seg_off(seg, off), val)) return;
+#endif
     cpu->mem[seg_off(seg, off)] = val;
 }
 
 static inline void mem_write16(CPU *cpu, uint16_t seg, uint16_t off, uint16_t val)
 {
+#ifdef RECOMP_MEM_HOOK
+    mem_write8(cpu, seg, off, (uint8_t)(val & 0xFF));
+    mem_write8(cpu, seg, (uint16_t)(off + 1), (uint8_t)(val >> 8));
+#else
     uint32_t addr = seg_off(seg, off);
     cpu->mem[addr] = (uint8_t)(val & 0xFF);
     cpu->mem[addr + 1] = (uint8_t)(val >> 8);
+#endif
 }
 
+/* 32-bit memory access from a 16-bit segment. A 386 in 16-bit code reads
+ * and writes dwords with an operand-size prefix, and code that handles
+ * far pointers or 32-bit fields does it constantly. The offset still wraps
+ * at 16 bits, so it is computed as uint16_t on purpose. */
 static inline uint32_t mem_read32(CPU *cpu, uint16_t seg, uint16_t off)
 {
-    uint32_t addr = seg_off(seg, off);
-    return (uint32_t)cpu->mem[addr] | ((uint32_t)cpu->mem[addr + 1] << 8) |
-           ((uint32_t)cpu->mem[addr + 2] << 16) | ((uint32_t)cpu->mem[addr + 3] << 24);
+    uint32_t lo = mem_read16(cpu, seg, off);
+    uint32_t hi = mem_read16(cpu, seg, (uint16_t)(off + 2));
+    return lo | (hi << 16);
 }
 
 static inline void mem_write32(CPU *cpu, uint16_t seg, uint16_t off, uint32_t val)
 {
-    uint32_t addr = seg_off(seg, off);
-    cpu->mem[addr]     = (uint8_t)(val & 0xFF);
-    cpu->mem[addr + 1] = (uint8_t)((val >> 8) & 0xFF);
-    cpu->mem[addr + 2] = (uint8_t)((val >> 16) & 0xFF);
-    cpu->mem[addr + 3] = (uint8_t)((val >> 24) & 0xFF);
+    mem_write16(cpu, seg, off, (uint16_t)(val & 0xFFFF));
+    mem_write16(cpu, seg, (uint16_t)(off + 2), (uint16_t)(val >> 16));
 }
 
 /* Data segment shortcuts (most common) */
@@ -157,17 +203,26 @@ static inline uint16_t pop16(CPU *cpu)
     return val;
 }
 
+/* 32-bit stack operations in a 16-bit segment.
+ *
+ * Not a contradiction: a 16-bit code segment on a 386 can carry an
+ * operand-size prefix and push a dword, and real code does - IR32's 16-bit
+ * half passes 32-bit arguments to its 32-bit half that way. SP is still a
+ * 16-bit offset into SS and still wraps as one, so the arithmetic is done
+ * in uint16_t deliberately. */
 static inline void push32(CPU *cpu, uint32_t val)
 {
-    cpu->sp -= 4;
-    mem_write32(cpu, cpu->ss, cpu->sp, val);
+    cpu->sp = (uint16_t)(cpu->sp - 4);
+    mem_write16(cpu, cpu->ss, cpu->sp, (uint16_t)(val & 0xFFFF));
+    mem_write16(cpu, cpu->ss, (uint16_t)(cpu->sp + 2), (uint16_t)(val >> 16));
 }
 
 static inline uint32_t pop32(CPU *cpu)
 {
-    uint32_t val = mem_read32(cpu, cpu->ss, cpu->sp);
-    cpu->sp += 4;
-    return val;
+    uint32_t lo = mem_read16(cpu, cpu->ss, cpu->sp);
+    uint32_t hi = mem_read16(cpu, cpu->ss, (uint16_t)(cpu->sp + 2));
+    cpu->sp = (uint16_t)(cpu->sp + 4);
+    return lo | (hi << 16);
 }
 
 /* ---------- Flags computation ---------- */
@@ -265,31 +320,6 @@ static inline void flags_cmp16(CPU *cpu, uint16_t a, uint16_t b)
     flags_sub16(cpu, a, b);
 }
 
-/* 32-bit compare (386 operand-size prefix paths) */
-static inline void set_szp32(CPU *cpu, uint32_t result)
-{
-    cpu->flags &= ~(FLAG_SF | FLAG_ZF | FLAG_PF);
-    if (result == 0)            cpu->flags |= FLAG_ZF;
-    if (result & 0x80000000u)   cpu->flags |= FLAG_SF;
-    if (parity8(result & 0xFF)) cpu->flags |= FLAG_PF;
-}
-
-static inline void flags_cmp32(CPU *cpu, uint32_t a, uint32_t b)
-{
-    uint32_t result = a - b;
-    cpu->flags &= ~(FLAG_CF | FLAG_OF | FLAG_AF | FLAG_SF | FLAG_ZF | FLAG_PF);
-    if (a < b)                                          cpu->flags |= FLAG_CF;
-    if (((a ^ b) & (a ^ result)) & 0x80000000u)         cpu->flags |= FLAG_OF;
-    if ((a ^ b ^ result) & 0x10)                        cpu->flags |= FLAG_AF;
-    set_szp32(cpu, result);
-}
-
-static inline void flags_logic32(CPU *cpu, uint32_t result)
-{
-    cpu->flags &= ~(FLAG_CF | FLAG_OF);
-    set_szp32(cpu, result);
-}
-
 /* Logical operation flags (CF=0, OF=0) */
 static inline void flags_logic8(CPU *cpu, uint8_t result)
 {
@@ -314,6 +344,68 @@ static inline void flags_shift16(CPU *cpu, uint16_t result)
     set_szp16(cpu, result);
 }
 
+/* ---------- 32-bit arithmetic from 16-bit code ----------
+ *
+ * A 386 running a 16-bit segment does 32-bit arithmetic with an operand-size
+ * prefix, and 16-bit code that handles far pointers, file offsets or 32-bit
+ * fields does it often. Same rules as the 16-bit forms with the sign bit and
+ * the carry boundary moved: SF is bit 31, and CF for ADD is the carry out of
+ * bit 31, which needs a 64-bit intermediate to see.
+ *
+ * SZP is set from the 32-bit result, and PF - as on real hardware - is the
+ * parity of the LOW BYTE only, not of the whole result. */
+static inline void set_szp32(CPU *cpu, uint32_t v)
+{
+    cpu->flags &= ~(FLAG_SF | FLAG_ZF | FLAG_PF);
+    if (v & 0x80000000u) cpu->flags |= FLAG_SF;
+    if (v == 0)          cpu->flags |= FLAG_ZF;
+    uint8_t low = (uint8_t)v;
+    low ^= (uint8_t)(low >> 4);
+    low ^= (uint8_t)(low >> 2);
+    low ^= (uint8_t)(low >> 1);
+    if (!(low & 1)) cpu->flags |= FLAG_PF;
+}
+
+static inline uint32_t flags_add32(CPU *cpu, uint32_t a, uint32_t b)
+{
+    uint64_t r = (uint64_t)a + b;
+    uint32_t result = (uint32_t)r;
+    cpu->flags &= ~(FLAG_CF | FLAG_OF | FLAG_AF | FLAG_SF | FLAG_ZF | FLAG_PF);
+    if (r > 0xFFFFFFFFu)                                cpu->flags |= FLAG_CF;
+    if (((~(a ^ b)) & (a ^ result)) & 0x80000000u)      cpu->flags |= FLAG_OF;
+    if ((a ^ b ^ result) & 0x10)                        cpu->flags |= FLAG_AF;
+    set_szp32(cpu, result);
+    return result;
+}
+
+static inline uint32_t flags_sub32(CPU *cpu, uint32_t a, uint32_t b)
+{
+    uint32_t result = a - b;
+    cpu->flags &= ~(FLAG_CF | FLAG_OF | FLAG_AF | FLAG_SF | FLAG_ZF | FLAG_PF);
+    if (a < b)                                       cpu->flags |= FLAG_CF;
+    if (((a ^ b) & (a ^ result)) & 0x80000000u)      cpu->flags |= FLAG_OF;
+    if ((a ^ b ^ result) & 0x10)                     cpu->flags |= FLAG_AF;
+    set_szp32(cpu, result);
+    return result;
+}
+
+static inline void flags_cmp32(CPU *cpu, uint32_t a, uint32_t b)
+{
+    flags_sub32(cpu, a, b);
+}
+
+static inline void flags_logic32(CPU *cpu, uint32_t result)
+{
+    cpu->flags &= ~(FLAG_CF | FLAG_OF);
+    set_szp32(cpu, result);
+}
+
+static inline void flags_shift32(CPU *cpu, uint32_t result)
+{
+    set_szp32(cpu, result);
+}
+
+
 /* ---------- Flag test helpers ---------- */
 static inline int cf(CPU *cpu) { return (cpu->flags & FLAG_CF) != 0; }
 static inline int zf(CPU *cpu) { return (cpu->flags & FLAG_ZF) != 0; }
@@ -322,6 +414,146 @@ static inline int of(CPU *cpu) { return (cpu->flags & FLAG_OF) != 0; }
 static inline int pf(CPU *cpu) { return (cpu->flags & FLAG_PF) != 0; }
 static inline int af(CPU *cpu) { return (cpu->flags & FLAG_AF) != 0; }
 static inline int df(CPU *cpu) { return (cpu->flags & FLAG_DF) != 0; }
+
+/* ---------- ADC / SBB ----------
+ *
+ * The carry is a THIRD input, and folding it into the source loses it:
+ * `flags_add16(a, b + cf)` with b = 0FFFFh and CF set adds zero and reports no
+ * carry out, so the high word of every long addition that happened to hit
+ * all-ones came out wrong -- silently, with a plausible number. One function
+ * per operation instead of one per width; `bits` picks the masks.
+ */
+static inline uint32_t flags_adc(CPU *cpu, uint32_t a, uint32_t b, int bits)
+{
+    uint32_t mask   = (bits == 32) ? 0xFFFFFFFFu : ((1u << bits) - 1u);
+    uint32_t sign   = 1u << (bits - 1);
+    uint64_t c      = (cpu->flags & FLAG_CF) ? 1u : 0u;
+    uint64_t wide   = (uint64_t)(a & mask) + (uint64_t)(b & mask) + c;
+    uint32_t result = (uint32_t)wide & mask;
+
+    a &= mask; b &= mask;
+    cpu->flags &= ~(FLAG_CF | FLAG_OF | FLAG_AF | FLAG_SF | FLAG_ZF | FLAG_PF);
+    if (wide > (uint64_t)mask)              cpu->flags |= FLAG_CF;
+    if ((~(a ^ b) & (a ^ result)) & sign)   cpu->flags |= FLAG_OF;
+    if ((a ^ b ^ result) & 0x10)            cpu->flags |= FLAG_AF;
+    if (result == 0)                        cpu->flags |= FLAG_ZF;
+    if (result & sign)                      cpu->flags |= FLAG_SF;
+    if (parity8((uint8_t)result))           cpu->flags |= FLAG_PF;
+    return result;
+}
+
+static inline uint32_t flags_sbb(CPU *cpu, uint32_t a, uint32_t b, int bits)
+{
+    uint32_t mask   = (bits == 32) ? 0xFFFFFFFFu : ((1u << bits) - 1u);
+    uint32_t sign   = 1u << (bits - 1);
+    uint64_t c      = (cpu->flags & FLAG_CF) ? 1u : 0u;
+    uint32_t result;
+
+    a &= mask; b &= mask;
+    result = (uint32_t)((uint64_t)a - (uint64_t)b - c) & mask;
+    cpu->flags &= ~(FLAG_CF | FLAG_OF | FLAG_AF | FLAG_SF | FLAG_ZF | FLAG_PF);
+    if ((uint64_t)a < (uint64_t)b + c)      cpu->flags |= FLAG_CF;
+    if (((a ^ b) & (a ^ result)) & sign)    cpu->flags |= FLAG_OF;
+    if ((a ^ b ^ result) & 0x10)            cpu->flags |= FLAG_AF;
+    if (result == 0)                        cpu->flags |= FLAG_ZF;
+    if (result & sign)                      cpu->flags |= FLAG_SF;
+    if (parity8((uint8_t)result))           cpu->flags |= FLAG_PF;
+    return result;
+}
+
+/* ---------- Packed / unpacked BCD ----------
+ *
+ * C compilers never emit these, so it is tempting to leave them out -- but
+ * MSC and Borland's own integer-to-decimal routines are hand-written assembly
+ * and AAM is how they split a byte into digits. Stubbed out, a game does not
+ * crash: it prints the wrong numbers. AF is a real input here (DAA, DAS, AAA
+ * and AAS all read it), which is why the 16-bit CPU carries it.
+ *
+ * Intel's pseudocode, followed literally, including DAA's second branch
+ * clearing CF where DAS's does not.
+ */
+static inline void bcd_daa(CPU *cpu)
+{
+    uint8_t old_al = cpu->al;
+    int old_cf = (cpu->flags & FLAG_CF) != 0;
+
+    cpu->flags &= ~FLAG_CF;
+    if ((cpu->al & 0x0F) > 9 || (cpu->flags & FLAG_AF)) {
+        cpu->al = (uint8_t)(cpu->al + 6);
+        cpu->flags |= FLAG_AF;
+    } else {
+        cpu->flags &= ~FLAG_AF;
+    }
+    if (old_al > 0x99 || old_cf) {
+        cpu->al = (uint8_t)(cpu->al + 0x60);
+        cpu->flags |= FLAG_CF;
+    }
+    set_szp8(cpu, cpu->al);
+}
+
+static inline void bcd_das(CPU *cpu)
+{
+    uint8_t old_al = cpu->al;
+    int old_cf = (cpu->flags & FLAG_CF) != 0;
+
+    cpu->flags &= ~FLAG_CF;
+    if ((cpu->al & 0x0F) > 9 || (cpu->flags & FLAG_AF)) {
+        if (old_al < 6) cpu->flags |= FLAG_CF;   /* borrow out of AL - 6 */
+        if (old_cf)     cpu->flags |= FLAG_CF;
+        cpu->al = (uint8_t)(cpu->al - 6);
+        cpu->flags |= FLAG_AF;
+    } else {
+        cpu->flags &= ~FLAG_AF;
+    }
+    if (old_al > 0x99 || old_cf) {
+        cpu->al = (uint8_t)(cpu->al - 0x60);
+        cpu->flags |= FLAG_CF;
+    }
+    set_szp8(cpu, cpu->al);
+}
+
+static inline void bcd_aaa(CPU *cpu)
+{
+    if ((cpu->al & 0x0F) > 9 || (cpu->flags & FLAG_AF)) {
+        /* AX += 106h, not AL += 6 and AH += 1 separately: the carry out of AL
+           propagates into AH, so AL = 0FFh lands on AH + 2. */
+        cpu->ax = (uint16_t)(cpu->ax + 0x106);
+        cpu->flags |= (FLAG_AF | FLAG_CF);
+    } else {
+        cpu->flags &= ~(FLAG_AF | FLAG_CF);
+    }
+    cpu->al &= 0x0F;
+}
+
+static inline void bcd_aas(CPU *cpu)
+{
+    if ((cpu->al & 0x0F) > 9 || (cpu->flags & FLAG_AF)) {
+        /* AX -= 106h for the same reason: a borrow out of AL takes AH with it. */
+        cpu->ax = (uint16_t)(cpu->ax - 0x106);
+        cpu->flags |= (FLAG_AF | FLAG_CF);
+    } else {
+        cpu->flags &= ~(FLAG_AF | FLAG_CF);
+    }
+    cpu->al &= 0x0F;
+}
+
+/* AAM's divisor is an operand, not always 10: `aam 16` is how assembly splits
+ * a byte into hex nibbles for display. A zero divisor is a divide-by-zero
+ * fault on hardware; leave AX alone rather than trap the host. */
+static inline void bcd_aam(CPU *cpu, uint8_t base)
+{
+    if (base == 0) return;
+    cpu->ah = (uint8_t)(cpu->al / base);
+    cpu->al = (uint8_t)(cpu->al % base);
+    set_szp8(cpu, cpu->al);
+}
+
+static inline void bcd_aad(CPU *cpu, uint8_t base)
+{
+    cpu->al = (uint8_t)(cpu->al + cpu->ah * base);
+    cpu->ah = 0;
+    set_szp8(cpu, cpu->al);
+}
 
 /* Condition code tests (matching x86 Jcc encodings) */
 static inline int cc_o(CPU *cpu)  { return of(cpu); }
@@ -341,16 +573,6 @@ static inline int cc_ge(CPU *cpu) { return sf(cpu) == of(cpu); } /* greater-or-e
 static inline int cc_le(CPU *cpu) { return zf(cpu) || (sf(cpu) != of(cpu)); } /* less-or-equal */
 static inline int cc_g(CPU *cpu)  { return !zf(cpu) && (sf(cpu) == of(cpu)); } /* greater */
 
-/* LSL (Load Segment Limit) - a 286+ protected-mode instruction. Real-mode DOS
- * code never executes it; it only turns up when a data table is decoded as
- * code. Always "fail" (ZF clear, no limit loaded) so such paths are inert. */
-static inline int cpu_lsl(CPU *cpu, uint16_t selector, uint16_t *out)
-{
-    (void)cpu; (void)selector;
-    if (out) *out = 0;
-    return 0;
-}
-
 /* ---------- CPU lifecycle ---------- */
 
 /* Initialize CPU state */
@@ -362,6 +584,62 @@ static inline void cpu_init(CPU *cpu)
 }
 
 /* Allocate flat memory */
+/* ---------- Interrupt poll ----------
+ *
+ * Lifted code runs to completion inside one C call: a guest loop is a C loop,
+ * and nothing outside it gets a turn. That is fatal for a DOS program, which
+ * routinely spins on a counter its own timer ISR increments and expects the
+ * hardware to interrupt it. The lifter emits RECOMP_TICK on every loop
+ * back-edge; the project implements recomp_tick to run whatever the guest is
+ * waiting for -- its timer handler, the host event pump.
+ *
+ * A budget rather than a clock read: the common case is one decrement. Set the
+ * budget from recomp_tick itself (it is re-armed there, not here) so the
+ * project picks its own poll rate. Built out entirely without RECOMP_IRQ. */
+#ifdef RECOMP_IRQ
+extern int g_recomp_tick_budget;
+void recomp_tick(CPU *cpu);
+#define RECOMP_TICK(cpu) do { if (--g_recomp_tick_budget <= 0) recomp_tick(cpu); } while (0)
+#else
+#define RECOMP_TICK(cpu) ((void)0)
+#endif
+
+/* ---------- Entry trace ----------
+ *
+ * Lifted code gives a host debugger nothing to work with: every frame is a
+ * function called sub_01A2F4 inside a generated file, and a runaway recursion
+ * blows the stack long before you can read one. Each lifted body announces
+ * itself here instead, into a ring buffer that is dumped when the C stack gets
+ * too deep -- which turns "it died somewhere" into the repeating cycle itself.
+ *
+ * Off unless the project is built with RECOMP_TRACE, and then it is one call
+ * and one compare per lifted function. No init call: the first entry records
+ * the stack base it measures against. */
+#ifdef RECOMP_TRACE
+void recomp_enter(const char *fn);
+void recomp_trace_dump(const char *why);
+#define RECOMP_ENTER(name) recomp_enter(name)
+#else
+#define RECOMP_ENTER(name) ((void)0)
+#endif
+
+/* LSL - segment limit. Real mode has no descriptors, so the limit of any
+ * segment is the 64K one the hardware gives it. */
+static inline int cpu_lsl(CPU *cpu, uint16_t selector, uint16_t *out)
+{
+    (void)cpu; (void)selector;
+    if (out) *out = 0xFFFF;
+    return 1;
+}
+
+/* Indirect-call resolvers. dispatch_near/_far unwind the return frame the
+ * lifted call site pushed when the target is unknown; recomp_dispatch is the
+ * tail-jump / far-return form and does not. */
+void recomp_dispatch(CPU *cpu, uint16_t seg, uint16_t off);
+void dispatch_near(CPU *cpu, uint16_t seg, uint16_t off);
+void dispatch_far(CPU *cpu, uint16_t seg, uint16_t off);
+void recomp_div0(const char *what);
+
 int cpu_alloc_mem(CPU *cpu);
 
 /* Free CPU resources */

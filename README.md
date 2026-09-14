@@ -99,9 +99,14 @@ This is an early, load-bearing foundation, not a finished port. What works
 
 - ✅ **LZEXE v0.91 unpacker** — standalone (`tools/unlzexe.py`) *and* a C port in
   the runtime; reproduces the 136,682-byte image with all 152 relocations.
-- ✅ **Recompiler pipeline** — lifts **~560 functions** (near *and* the
+- ✅ **Recompiler pipeline** — lifts **886 functions** (near *and* the
   Microsoft-C large-model far-code segments above DGROUP) with zero lifter
-  errors, every call resolved (no dispatch misses), sharded across ~13 files.
+  errors, sharded across 18 files.
+  The toolchain is synced from
+  [pcrecomp](https://github.com/sp00nznet/pcrecomp), so the 16-bit lifter's
+  correctness fixes — ADC/SBB carry as a real input, shift flags at a zero or
+  oversized count, 32-bit MUL/DIV, three-operand IMUL, string-op segment
+  overrides, word port I/O, a non-fatal divide-by-zero — land here too.
 - ✅ **Relocation-correct lifting** — segment immediates are rebased by the load
   segment exactly as DOS would, so `DS` points at the real DGROUP. This is what
   lets the game find its own data.
@@ -109,12 +114,23 @@ This is an early, load-bearing foundation, not a finished port. What works
 - ✅ **Boots into the game** — feed it the original `COASTER.EXE` and it unpacks,
   relocates, runs the Microsoft-C startup into the game's `main()`, opens the
   real `COASTER1.RSC` / `HSCORE.DAT`, and **reads its resource files**.
+- ✅ **Boots through device setup** - it probes the AdLib at 0x388 and a Sound
+  Blaster at 0x226, switches to text mode 3, then to **VGA mode 13h**, and
+  unchains it into **Mode X** (SEQ index 4 <- 0x06, GC index 5 <- 0x40, CRTC
+  index 0x14 <- 0). That is the real 1993 video driver running.
 
 What's **not** there yet:
 
-- ⏳ It currently **hangs partway through resource loading** — a tight loop in
-  real game code (likely a vertical-retrace/timer poll or a subtle lifting bug
-  in a decompression routine), so it doesn't yet reach the title screen.
+- ⏳ **Nothing is drawn.** The HAL renders mode 13h as a linear 320x200 buffer
+  at A000, but the game unchains the VGA - the framebuffer is four planes
+  selected by the Sequencer Map Mask, so a linear read is not the picture.
+  Mode X support in the video HAL (via the `RECOMP_MEM_HOOK` hook the runtime
+  already carries) is the next real piece of work.
+- ⏳ **One unresolved indirect jump derails startup.** `[DISPATCH] jmp miss
+  0187:0000` - a driver slot that is still null when it is called. Control
+  returns to the wrong place, the next thing executed is a garbage `INT 21h
+  AH=3Bh`, and the program then sits in `sub_0017C8` forever. Everything after
+  this point in the log is downstream of that one miss.
 - ⏳ Function-boundary detection is heuristic; a few far-code spans over data
   tables are imperfect, and some C-runtime/native shims are still stubs.
 - ⏳ Rendering the actual coaster view is future work.
@@ -174,7 +190,7 @@ coaster/
 │   └── platform/          SDL2 window, renderer, input
 ├── include/               public headers (recomp/, hal/, platform/)
 ├── RecompiledFuncs/        AUTO-GENERATED lifted C (regenerate with recomp.py)
-│   ├── coaster_recomp_*.c  the 234 lifted functions
+│   ├── coaster_recomp_*.c  the 886 lifted functions
 │   ├── coaster_dispatch.c  indirect/far-call resolver table
 │   ├── coaster_stubs.c     stubs for not-yet-identified targets
 │   └── coaster_impl.c      hand-written overrides (wins at link time)
@@ -186,11 +202,14 @@ coaster/
 1. ~~Get the Microsoft-C startup to reach the game's `main()`.~~ ✅ done
 2. ~~Load the game's resource files (`COASTER1.RSC`, the `.TRA` tracks).~~ ✅ the
    game opens and reads them.
-3. **Crack the resource-loading hang** ← *we are here.* A tight loop in real
-   lifted code with no I/O — instrument the port reads / timer tick to tell a
-   hardware poll apart from a lifting bug, then squash it.
-4. Get the title screen and menu rendering through the VGA/EGA HAL.
-5. Track editor → ride view → the six judges. Make Mouszila ride again.
+3. ~~Crack the resource-loading hang.~~ ✅ Three things: indirect jumps lowered
+   to comments (control fell through into garbage), no interrupt poll (the game
+   busy-waits on a counter its own INT 1Ch handler increments), and near calls
+   that wrap past their segment base being dropped on the floor.
+4. **Get a picture on screen** ← *we are here.* Mode X in the video HAL, and the
+   null driver slot behind `jmp miss 0187:0000`.
+5. Title screen and menus through the VGA HAL.
+6. Track editor → ride view → the six judges. Make Mouszila ride again.
 
 ### How we got here (milestones)
 

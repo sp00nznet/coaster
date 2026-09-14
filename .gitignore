@@ -53,3 +53,17 @@ Thumbs.db
 # ─── Python ───
 __pycache__/
 *.pyc
+
+# ─────────────────────────────────────────────────────────────────────
+#  LIFTED OUTPUT — never commit. It is a derivative work of the game.
+#
+#  Lifting a binary produces a derivative work of that binary, so the
+#  generated C carries whatever licence the original does. Committing it
+#  publishes the game's code in another form. Every public repo in this
+#  family tracks zero lifted files; regenerate it from your own copy.
+#
+#  Keeping it out also keeps the repo small: stripping it from one
+#  project took its history from 20.6 MB to 3.3 MB.
+# ─────────────────────────────────────────────────────────────────────
+RecompiledFuncs/
+src/recomp/gen/

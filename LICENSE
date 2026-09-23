@@ -22,11 +22,18 @@ SOFTWARE.
 
 ---
 
+Scope
+
 This license covers ONLY the original recompilation code, tooling, and runtime
 in this repository.
 
 It does NOT cover the game "Coaster" / "Roller Coaster Construction Set" or any
-of its data. Coaster is Copyright (c) 1993 its respective rights holders. No
+of its data. Coaster is Copyright (c) 1993 Walt Disney Computer Software. No
 original game executables, resource files (.RSC), track files (.TRA), or other
-game assets are included in this repository. You must supply your own legally
+game assets are included in this repository.
+
+It also does NOT cover the lifted C that tools/recomp.py produces
+(RecompiledFuncs/). That output is a derivative work of the original
+executable, carries whatever license the original does, and is generated from
+your own copy rather than distributed here. You must supply your own legally
 obtained copy of the game to build and run this project.

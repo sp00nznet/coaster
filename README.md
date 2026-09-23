@@ -103,7 +103,8 @@ This is an early, load-bearing foundation, not a finished port. What works
   Microsoft-C large-model far-code segments above DGROUP) with zero lifter
   errors, sharded across 18 files.
   The toolchain is synced from
-  [pcrecomp](https://github.com/sp00nznet/pcrecomp), so the 16-bit lifter's
+  [pcrecomp](https://github.com/sp00nznet/pcrecomp), the family's shared
+  recompilation toolkit, so the 16-bit lifter's
   correctness fixes — ADC/SBB carry as a real input, shift flags at a zero or
   oversized count, 32-bit MUL/DIV, three-operand IMUL, string-op segment
   overrides, word port I/O, a non-fatal divide-by-zero — land here too.
@@ -141,34 +142,33 @@ but it hasn't pulled out of the station yet. 🎢
 ### Build it
 
 **Requirements:** CMake 3.20+, a C17 compiler (MSVC 2022 tested), and SDL2
-(easiest via [vcpkg](https://vcpkg.io)). Python 3.10+ only if you want to
-re-run the recompiler.
+(easiest via [vcpkg](https://vcpkg.io)). Python 3.10+ for the recompiler,
+which you run once to produce the lifted C.
+
+The lifted C is **not in this repository** — it is a derivative work of
+Disney's binary, so you generate it locally from your own copy. That step comes
+first; CMake only builds the `coaster` executable once `RecompiledFuncs/` exists.
 
 ```bash
-# 1. Configure (point at your vcpkg toolchain for SDL2)
-cmake -S . -B build \
-  -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake \
-  -DVCPKG_TARGET_TRIPLET=x64-windows
+# 1. Lift your own copy to C (writes RecompiledFuncs/, which git ignores)
+python tools/unlzexe.py COASTER.EXE COASTER_unpacked.exe      # decompress
+python tools/recomp.py  COASTER_unpacked.exe RecompiledFuncs   # lift to C
 
-# 2. Build
+# 2. Configure (point at your vcpkg toolchain for SDL2)
+cmake -S . -B build   -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake   -DVCPKG_TARGET_TRIPLET=x64-windows
+
+# 3. Build
 cmake --build build --config Release
 
-# 3. Run — point it at YOUR legally-owned packed COASTER.EXE
+# 4. Run — point it at YOUR legally-owned packed COASTER.EXE
 ./build/Release/coaster.exe path/to/COASTER.EXE --gamedir path/to/gamefiles
-```
-
-Want to regenerate the lifted C from your own copy?
-
-```bash
-python tools/unlzexe.py COASTER.EXE COASTER_unpacked.exe   # decompress
-python tools/recomp.py  COASTER_unpacked.exe RecompiledFuncs  # lift to C
 ```
 
 ### Bring your own game 🎟️
 
 This repository contains **none** of Coaster's copyrighted material — no
-executable, no `COASTER1.RSC` resource blob, no `.TRA` tracks, no art or audio.
-Coaster is © 1993 its respective rights holders. To build and play, supply your
+executable, no `COASTER1.RSC` resource blob, no `.TRA` tracks, no art or audio,
+and no lifted C. Coaster is © 1993 Walt Disney Computer Software. To build and play, supply your
 own legally obtained copy of the game; the loader expects the original
 LZEXE-packed `COASTER.EXE`. See [`LICENSE`](LICENSE) — the MIT license covers
 *our* code only.
@@ -189,11 +189,11 @@ coaster/
 │   ├── hal/               video / input / timer hardware abstraction
 │   └── platform/          SDL2 window, renderer, input
 ├── include/               public headers (recomp/, hal/, platform/)
-├── RecompiledFuncs/        AUTO-GENERATED lifted C (regenerate with recomp.py)
+├── RecompiledFuncs/        generated locally by recomp.py — NOT tracked
 │   ├── coaster_recomp_*.c  the 886 lifted functions
 │   ├── coaster_dispatch.c  indirect/far-call resolver table
 │   ├── coaster_stubs.c     stubs for not-yet-identified targets
-│   └── coaster_impl.c      hand-written overrides (wins at link time)
+│   └── coaster_impl.c      optional hand-written overrides (win at link time)
 └── CMakeLists.txt
 ```
 
@@ -221,7 +221,7 @@ code *behave*. The fixes that moved the needle, in order:
 | **LZEXE v0.91 unpacker** (Python + C port) | The on-disk EXE is a compressed blob; nothing is possible until it's expanded and relocated. |
 | **Relocation-aware lifting** | The lifter baked the *un-relocated* `MOV DS, DGROUP`; `DS` pointed into the void and every filename read came back garbage (`"./H"`). Rebasing segment immediates by the load segment is what made the game find its own data — it instantly started opening `COASTER1.RSC`. |
 | **DOS `INT 21h/48` off-by-one** | Startup asked for exactly the free memory and the allocator refused it, deadlocking the boot. |
-| **Signed branch displacements** | Backward `call`/`jmp`/`jcc` wrapped ~64 KB forward into phantom symbols. Reading them as signed (in both the lifter and the function-discovery pass) resolved every call — zero dispatch misses. |
+| **Signed branch displacements** | Backward `call`/`jmp`/`jcc` wrapped ~64 KB forward into phantom symbols. Reading them as signed (in both the lifter and the function-discovery pass) resolved every direct call. (The one miss left, `0187:0000`, is an indirect jump through a driver slot — see status.) |
 | **Secondary-entry & far-code lifting** | Loops that branch *before* their own entry, plus the MSC large-model far-code segments above DGROUP, are now lifted correctly. |
 
 ---
